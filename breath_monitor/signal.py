@@ -189,9 +189,7 @@ class BreathingSignalProcessor:
         cutoff_time = current_time - window_seconds
 
         # Get peaks within time window
-        recent_peaks = [
-            t for t in self.peak_times if t >= cutoff_time
-        ]
+        recent_peaks = [t for t in self.peak_times if t >= cutoff_time]
 
         if len(recent_peaks) < 2:
             return None
@@ -275,6 +273,27 @@ class BreathingSignalProcessor:
             "buffer_full": self.buffer.is_full(),
         }
 
+    def process(self) -> dict:
+        """Process signal and return breathing metrics (test-compatible interface).
+
+        Returns:
+            Dictionary with 'breathing_rate', 'amplitude', and 'quality'
+        """
+        metrics = self.get_metrics()
+        peaks, peak_vals = self.detect_peaks()
+
+        # Calculate mean amplitude from recent peaks
+        if len(peak_vals) > 0:
+            amplitude = float(np.mean(np.abs(peak_vals)))
+        else:
+            amplitude = 0.0
+
+        return {
+            "breathing_rate": metrics["bpm"],
+            "amplitude": amplitude,
+            "quality": metrics["signal_quality"],
+        }
+
     def reset(self):
         """Reset processor state."""
         self.buffer.clear()
@@ -309,16 +328,12 @@ if __name__ == "__main__":
     metrics = processor.get_metrics()
     print(f"\nMetrics:")
     print(
-        f"  BPM: {metrics['bpm']:.1f}"
-        if metrics["bpm"]
-        else "  BPM: N/A"
+        f"  BPM: {metrics['bpm']:.1f}" if metrics["bpm"] else "  BPM: N/A"
     )
     print(f"  Apnea: {metrics['apnea']}")
     print(f"  Shallow: {metrics['shallow']}")
     print(f"  Signal Quality: {metrics['signal_quality']:.2f}")
-    print(
-        f"  Buffer: {metrics['buffer_size']}/{processor.buffer.maxlen}"
-    )
+    print(f"  Buffer: {metrics['buffer_size']}/{processor.buffer.maxlen}")
 
     # Test filtering
     filtered = processor.filter_signal()
