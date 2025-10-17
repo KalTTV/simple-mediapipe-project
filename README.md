@@ -10,10 +10,12 @@ Real-time breathing rate monitoring using MediaPipe Pose. Track breathing from s
 
 **⚠️ FOR RESEARCH/DEMO ONLY - NOT A MEDICAL DEVICE**
 
+Enhanced with **chest expansion detection**: 32-point multi-tracker with hysteresis breath counting (prevents BPM overestimation).
+
 ```bash
-# Quick start
+# Quick start (with chest expansion detection)
 pip install -e .
-python -m breath_monitor --draw on
+python -m breath_monitor --draw on --trackers 32 --min-ibi-sec 2.0
 
 # Or launch web UI
 streamlit run breath_monitor/ui_streamlit.py
@@ -126,8 +128,14 @@ python main.py --mode face
 ### Breathing Monitor
 
 ```bash
-# CLI with visualization
-python -m breath_monitor --draw on
+# CLI with chest expansion detection
+python -m breath_monitor --draw on --trackers 32 --min-ibi-sec 2.0
+
+# Adjust debounce (higher = prevents overcounting, lower = more sensitive)
+python -m breath_monitor --draw on --trackers 32 --min-ibi-sec 3.0
+
+# Wide respiratory band (5-72 BPM)
+python -m breath_monitor --draw on --resp-low 0.08 --resp-high 1.2
 
 # Web UI
 streamlit run breath_monitor/ui_streamlit.py
@@ -135,10 +143,15 @@ streamlit run breath_monitor/ui_streamlit.py
 # Using Make
 make run    # CLI
 make ui     # Web UI
-
-# With custom settings
-python -m breath_monitor --camera 0 --apnea-sec 15 --draw on --ws on
 ```
+
+**Key Flags**:
+- `--trackers 32`: Number of chest points to track (default: 32)
+- `--min-ibi-sec 2.0`: Minimum inter-breath interval / debounce (prevents double counts)
+- `--resp-low 0.08 --resp-high 1.2`: Wide respiratory band (5-72 BPM)
+- `--tracker-refresh 0.5`: Tracker refresh period (seconds)
+
+**Note**: BPM is displayed as computed (no age-range clamping). Use confidence to judge reliability.
 
 See [docs/BREATHING_README.md](docs/BREATHING_README.md) for detailed usage.
 

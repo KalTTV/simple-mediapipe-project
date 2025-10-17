@@ -167,9 +167,43 @@ class BreathingVisualizer:
         
         return frame
     
+    def draw_chest_roi(self, frame: np.ndarray, roi: Optional[np.ndarray]) -> np.ndarray:
+        """
+        Draw chest ROI polygon.
+        
+        Args:
+            frame: Input frame
+            roi: 4-point polygon or None
+            
+        Returns:
+            Frame with ROI overlay
+        """
+        if roi is not None and len(roi) == 4:
+            roi_int = roi.astype(np.int32)
+            cv2.polylines(frame, [roi_int], isClosed=True, color=(255, 255, 0), thickness=2)
+        return frame
+    
+    def draw_tracked_points(self, frame: np.ndarray, tracked_points: Optional[np.ndarray]) -> np.ndarray:
+        """
+        Draw tracked chest points.
+        
+        Args:
+            frame: Input frame
+            tracked_points: Array of shape (N, 1, 2) or None
+            
+        Returns:
+            Frame with tracked points overlay
+        """
+        if tracked_points is not None and len(tracked_points) > 0:
+            for point in tracked_points:
+                x, y = point[0]
+                cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 255), -1)  # Yellow dots
+                cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 255), 1)   # Yellow rings
+        return frame
+    
     def draw_all(self, frame: np.ndarray, pose_result: dict, analysis_result: dict) -> np.ndarray:
         """
-        Draw complete visualization.
+        Draw complete visualization with tracking markers.
         
         Args:
             frame: Input frame
@@ -179,16 +213,26 @@ class BreathingVisualizer:
         Returns:
             Frame with all overlays
         """
-        # Draw pose
+        # Draw pose skeleton
         if pose_result.get("detected") and pose_result.get("landmarks"):
             frame = self.draw_pose(frame, pose_result["landmarks"])
             
-            # Add trace point
+            # Draw chest ROI
+            chest_roi = pose_result.get("chest_roi")
+            if chest_roi is not None:
+                frame = self.draw_chest_roi(frame, chest_roi)
+            
+            # Draw tracked points
+            tracked_points = pose_result.get("tracked_points")
+            if tracked_points is not None:
+                frame = self.draw_tracked_points(frame, tracked_points)
+            
+            # Add trace point for mid-shoulder
             if pose_result.get("mid_shoulder_xy"):
                 x, y = pose_result["mid_shoulder_xy"]
                 self.add_trace_point(x, y, frame.shape)
         
-        # Draw trace
+        # Draw movement trace
         frame = self.draw_trace(frame)
         
         # Draw HUD
@@ -199,8 +243,8 @@ class BreathingVisualizer:
             apnea=analysis_result.get("apnea", False),
             shallow=analysis_result.get("shallow", False),
             confidence=pose_result.get("confidence", 0.0),
-            tachypnea=analysis_result.get("tachypnea", False),
-            bradypnea=analysis_result.get("bradypnea", False)
+            tachypnea=False,  # Not using these in new version
+            bradypnea=False
         )
         
         return frame
