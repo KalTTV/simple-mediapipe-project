@@ -1,222 +1,172 @@
-"""WebSocket server for broadcasting breathing metrics to connected clients."""
+"""
+WebSocket server for broadcasting breathing state.
+"""
 
 import asyncio
 import json
-import logging
-from typing import Set, Dict, Any
 import websockets
-from websockets.server import WebSocketServerProtocol
+from typing import Optional, Set
+import threading
 
-logger = logging.getLogger(__name__)
 
-
-class BreathingMetricsServer:
-    """WebSocket server for broadcasting breathing metrics."""
-
+class WebSocketBroadcaster:
+    """WebSocket server for broadcasting breathing monitor state."""
+    
     def __init__(self, host: str = "localhost", port: int = 8765):
         """
-        Initialize the WebSocket server.
-
+        Initialize WebSocket broadcaster.
+        
         Args:
-            host: Host address to bind the server
-            port: Port number for the WebSocket server
+            host: Server host
+            port: Server port
         """
         self.host = host
         self.port = port
-        self.clients: Set[WebSocketServerProtocol] = set()
-        self.running = False
+        self.clients: Set = set()
         self.server = None
-
-    async def register_client(self, websocket: WebSocketServerProtocol):
-        """Register a new client connection."""
+        self.loop = None
+        self.thread = None
+        self.running = False
+        self.latest_state = {}
+        
+    async def _register(self, websocket):
+        """Register a new client."""
         self.clients.add(websocket)
-        logger.info(f"Client connected. Total clients: {len(self.clients)}")
-        # Send initial connection confirmation
-        await self.send_to_client(
-            websocket,
-            {
-                "type": "connection",
-                "status": "connected",
-                "message": "Connected to breathing metrics server"
-            }
-        )
-
-    async def unregister_client(self, websocket: WebSocketServerProtocol):
-        """Unregister a client connection."""
+        print(f"[WS] Client connected. Total clients: {len(self.clients)}")
+        
+    async def _unregister(self, websocket):
+        """Unregister a client."""
         self.clients.discard(websocket)
-        logger.info(f"Client disconnected. Total clients: {len(self.clients)}")
-
-    async def send_to_client(self, websocket: WebSocketServerProtocol, data: Dict[str, Any]):
-        """Send data to a specific client."""
+        print(f"[WS] Client disconnected. Total clients: {len(self.clients)}")
+        
+    async def _handler(self, websocket, path):
+        """Handle WebSocket connections."""
+        await self._register(websocket)
         try:
-            message = json.dumps(data)
-            await websocket.send(message)
-        except Exception as e:
-            logger.error(f"Error sending to client: {e}")
-
-    async def broadcast_metrics(self, metrics: Dict[str, Any]):
-        """
-        Broadcast breathing metrics to all connected clients.
-
-        Args:
-            metrics: Dictionary containing breathing metrics
-                Expected keys:
-                - bpm: Breaths per minute (float)
-                - apnea_detected: Boolean indicating apnea detection
-                - shallow_breathing: Boolean indicating shallow breathing
-                - timestamp: ISO format timestamp (optional)
-        """
-        if not self.clients:
-            return
-
-        # Format the message
-        message = {
-            "type": "metrics",
-            "data": {
-                "bpm": metrics.get("bpm", 0.0),
-                "apnea_detected": metrics.get("apnea_detected", False),
-                "shallow_breathing": metrics.get("shallow_breathing", False),
-                "timestamp": metrics.get("timestamp", "")
-            }
-        }
-
-        # Send to all clients
-        disconnected_clients = set()
-        for websocket in self.clients:
-            try:
-                await self.send_to_client(websocket, message)
-            except websockets.exceptions.ConnectionClosed:
-                disconnected_clients.add(websocket)
-            except Exception as e:
-                logger.error(f"Error broadcasting to client: {e}")
-                disconnected_clients.add(websocket)
-
-        # Clean up disconnected clients
-        for websocket in disconnected_clients:
-            await self.unregister_client(websocket)
-
-    async def handle_client(self, websocket: WebSocketServerProtocol):
-        """Handle individual client connections."""
-        await self.register_client(websocket)
-        try:
-            # Keep connection alive and handle incoming messages
+            # Send latest state on connection
+            if self.latest_state:
+                await websocket.send(json.dumps(self.latest_state))
+            
+            # Keep connection alive
             async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    # Handle client messages (ping, subscription requests, etc.)
-                    if data.get("type") == "ping":
-                        await self.send_to_client(websocket, {"type": "pong"})
-                    elif data.get("type") == "subscribe":
-                        await self.send_to_client(
-                            websocket,
-                            {"type": "subscribed", "status": "success"}
-                        )
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON received: {message}")
-                except Exception as e:
-                    logger.error(f"Error handling client message: {e}")
+                pass  # We don't expect messages from clients
         except websockets.exceptions.ConnectionClosed:
-            logger.info("Client connection closed")
+            pass
         finally:
-            await self.unregister_client(websocket)
-
-    async def start(self):
-        """Start the WebSocket server."""
+            await self._unregister(websocket)
+    
+    async def _broadcast(self, message: str):
+        """Broadcast message to all connected clients."""
+        if self.clients:
+            await asyncio.gather(
+                *[client.send(message) for client in self.clients],
+                return_exceptions=True
+            )
+    
+    def _run_server(self):
+        """Run WebSocket server in event loop."""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        start_server = websockets.serve(self._handler, self.host, self.port)
+        self.server = self.loop.run_until_complete(start_server)
+        
+        print(f"[WS] Server started on ws://{self.host}:{self.port}")
         self.running = True
-        self.server = await websockets.serve(
-            self.handle_client,
-            self.host,
-            self.port
-        )
-        logger.info(f"WebSocket server started on ws://{self.host}:{self.port}")
-
-    async def stop(self):
-        """Stop the WebSocket server."""
+        
+        try:
+            self.loop.run_forever()
+        finally:
+            self.running = False
+    
+    def start(self):
+        """Start WebSocket server in background thread."""
+        if self.thread and self.thread.is_alive():
+            print("[WS] Server already running")
+            return
+        
+        self.thread = threading.Thread(target=self._run_server, daemon=True)
+        self.thread.start()
+        
+        # Wait for server to start
+        import time
+        for _ in range(50):  # 5 seconds max
+            if self.running:
+                break
+            time.sleep(0.1)
+    
+    def stop(self):
+        """Stop WebSocket server."""
+        if not self.running:
+            return
+        
+        print("[WS] Stopping server...")
+        
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        
         self.running = False
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-        # Close all client connections
-        for websocket in self.clients.copy():
-            await websocket.close()
-        self.clients.clear()
-        logger.info("WebSocket server stopped")
-
-
-class BreathingMetricsPublisher:
-    """Publishes breathing metrics at periodic intervals."""
-
-    def __init__(self, server: BreathingMetricsServer, update_interval: float = 1.0):
+        print("[WS] Server stopped")
+    
+    def broadcast_state(self, bpm: Optional[float], apnea: bool, shallow: bool, 
+                       confidence: float, timestamp: float):
         """
-        Initialize the metrics publisher.
-
+        Broadcast current breathing state.
+        
         Args:
-            server: BreathingMetricsServer instance
-            update_interval: Time between metric updates in seconds
+            bpm: Current BPM (or None)
+            apnea: Apnea detected
+            shallow: Shallow breathing detected
+            confidence: Confidence level
+            timestamp: Timestamp
         """
-        self.server = server
-        self.update_interval = update_interval
-        self.running = False
-        self._task = None
-
-    async def publish_periodic_metrics(self, metrics_callback):
-        """
-        Periodically publish metrics from a callback function.
-
-        Args:
-            metrics_callback: Callable that returns current metrics dict
-        """
-        self.running = True
-        while self.running:
-            try:
-                metrics = metrics_callback()
-                if metrics:
-                    await self.server.broadcast_metrics(metrics)
-                await asyncio.sleep(self.update_interval)
-            except Exception as e:
-                logger.error(f"Error publishing metrics: {e}")
-                await asyncio.sleep(self.update_interval)
-
-    def start(self, metrics_callback):
-        """Start publishing metrics."""
-        self._task = asyncio.create_task(self.publish_periodic_metrics(metrics_callback))
-        return self._task
-
-    async def stop(self):
-        """Stop publishing metrics."""
-        self.running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        state = {
+            "bpm": bpm,
+            "apnea": apnea,
+            "shallow": shallow,
+            "confidence": confidence,
+            "timestamp": timestamp
+        }
+        
+        self.latest_state = state
+        
+        if self.running and self.loop and self.clients:
+            message = json.dumps(state)
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast(message), 
+                self.loop
+            )
 
 
-async def run_server(host: str = "localhost", port: int = 8765):
-    """
-    Run the WebSocket server.
-
-    Example usage:
-        asyncio.run(run_server())
-    """
-    server = BreathingMetricsServer(host, port)
-    await server.start()
+def main():
+    """Test WebSocket server."""
+    import time
+    
+    broadcaster = WebSocketBroadcaster()
+    broadcaster.start()
+    
+    print("Broadcasting test data... Press Ctrl+C to stop")
+    
     try:
-        # Keep server running indefinitely
-        await asyncio.Future()
+        for i in range(100):
+            bpm = 40 + 10 * (i % 3)
+            broadcaster.broadcast_state(
+                bpm=bpm,
+                apnea=i % 20 == 0,
+                shallow=i % 15 == 0,
+                confidence=0.8,
+                timestamp=time.time()
+            )
+            time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Shutting down server...")
+        print("\n[INFO] Interrupted by user")
     finally:
-        await server.stop()
+        broadcaster.stop()
 
 
 if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    main()
 
-    # Run the server
-    asyncio.run(run_server())

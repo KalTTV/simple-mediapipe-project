@@ -1,3 +1,2 @@
-"""Breath monitoring package using MediaPipe pose estimation."""
+"""Breath Monitor Package - Real-time infant breathing rate monitor using MediaPipe Pose."""
 
-__version__ = "0.1.0"

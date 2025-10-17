@@ -1,265 +1,241 @@
-# Breathing Signal Processing Pipeline
+# Algorithm Overview
 
-This document explains the complete algorithm used to detect and monitor breathing patterns in real-time using MediaPipe pose landmarks.
+## Pipeline Diagram
 
-## Overview
+```
+┌──────────────┐
+│   Camera     │
+│   Capture    │
+└──────┬───────┘
+       │ RGB Frame + Timestamp
+       ▼
+┌──────────────┐
+│  MediaPipe   │
+│  Pose Model  │
+└──────┬───────┘
+       │ 33 Landmarks (image + world coords)
+       ▼
+┌──────────────┐
+│  Extract     │
+│ Mid-Shoulder │ ← Average of L/R shoulder landmarks
+│  (Y coord)   │
+└──────┬───────┘
+       │ Raw signal (normalized Y position)
+       ▼
+┌──────────────┐
+│ Time-based   │
+│ Ring Buffer  │ ← 15-second sliding window
+└──────┬───────┘
+       │ Buffered signal + timestamps
+       ▼
+┌──────────────┐
+│   Detrend    │
+│ (Polynomial  │ ← Remove baseline drift
+│  or HP)      │
+└──────┬───────┘
+       │ Detrended signal
+       ▼
+┌──────────────┐
+│  Butterworth │
+│  Bandpass    │ ← 0.5-1.2 Hz (30-72 BPM)
+│  Filter      │
+└──────┬───────┘
+       │ Filtered signal
+       ▼
+┌──────────────┐
+│    Peak      │
+│  Detection   │ ← scipy.signal.find_peaks
+└──────┬───────┘
+       │ Peak indices + timestamps
+       ▼
+┌──────────────┐
+│  Calculate   │
+│     BPM      │ ← 60 / median(inter-peak intervals)
+└──────┬───────┘
+       │ Raw BPM
+       ▼
+┌──────────────┐
+│     EMA      │
+│  Smoothing   │ ← Exponential moving average (α=0.3)
+└──────┬───────┘
+       │ Smoothed BPM
+       ▼
+┌──────────────┐
+│   Anomaly    │
+│  Detection   │ ← Apnea, Shallow, Tachy/Brady
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────────────┐
+│  Display + WebSocket Output  │
+└──────────────────────────────┘
+```
 
-The breathing detection system processes video frames to extract chest movement, filters the signal, detects breathing cycles, and identifies abnormal breathing events such as apnea (breathing stopped) and shallow breathing.
+## Rationale for Shoulder Proxy
 
-## Pipeline Stages
+### Why Shoulders?
 
-### 1. Chest Keypoint Extraction
+1. **Visibility**: Shoulders are consistently visible from most camera angles, unlike chest directly
+2. **Motion**: Chest expansion/contraction causes vertical shoulder displacement
+3. **Robustness**: Less affected by clothing than direct chest tracking
+4. **Landmark Quality**: MediaPipe Pose provides high-confidence shoulder landmarks
 
-The first stage extracts relevant pose landmarks from each video frame using MediaPipe Pose.
+### Signal Extraction
 
-**Process:**
-- MediaPipe detects 33 pose landmarks on the body
-- We focus on chest-related landmarks:
-  - **Left Shoulder** (landmark 11)
-  - **Right Shoulder** (landmark 12)
-  - **Left Hip** (landmark 23)
-  - **Right Hip** (landmark 24)
+- **Primary**: Mid-shoulder Y coordinate (image space, normalized 0-1)
+  - Upward chest expansion → shoulders rise (Y decreases in image coords)
+  - Chest contraction → shoulders lower (Y increases)
+  
+- **Fallback**: World Z coordinate (depth)
+  - For frontal views, Z motion may also capture breathing
+  - Less reliable due to depth estimation noise
 
-**Chest Distance Calculation:**
+### Limitations
+
+- **Occlusion**: Blankets covering shoulders will lose tracking
+- **Motion**: Subject movement can contaminate signal (mitigated by detrending)
+- **Camera Angle**: Best with slightly elevated camera viewing infant from above
+- **Clothing**: Tight-fitting clothing provides better landmark stability
+
+## Frequency Band Selection
+
+### Infant Breathing Rate Range
+
+- **Normal**: 30-60 breaths/minute (0.5-1.0 Hz)
+- **Extended**: 20-70 breaths/minute (0.33-1.17 Hz)
+
+### Chosen Bandpass: 0.5-1.2 Hz (30-72 BPM)
+
+**Rationale**:
+- Covers normal + tachypnea range
+- Excludes cardiac signal (~1.5-2.5 Hz for infants)
+- Removes low-frequency drift (<0.5 Hz)
+- Configurable via CLI flags for different age groups
+
+### Filter Design
+
+- **Type**: Butterworth (4th order)
+- **Implementation**: Zero-phase filtfilt (no delay)
+- **Trade-off**: Narrow band for specificity vs. false negatives
+
+## Peak Detection Strategy
+
+### scipy.signal.find_peaks
+
+**Parameters**:
+- `distance`: Refractory period ≈ 0.6s (prevents double-counting)
+- `height`: None (adaptive to signal amplitude)
+- `prominence`: Implicit (handled by bandpass)
+
+### BPM Calculation
+
+- **Method**: Median of inter-peak intervals (robust to outliers)
+- **Formula**: BPM = 60 / median(diff(peak_times))
+- **Minimum Peaks**: 2 (returns None if insufficient)
+
+### Display Smoothing
+
+- **EMA**: α = 0.3 (balances responsiveness and stability)
+- **Purpose**: Reduces display jitter while tracking changes
+
+## Anomaly Detection
+
+### Apnea
+
+**Definition**: No peaks detected for ≥ apnea_sec (default 20s)
+
+**Logic**:
 ```python
-# Calculate midpoints
-left_mid = (left_shoulder + left_hip) / 2
-right_mid = (right_shoulder + right_hip) / 2
-
-# Compute Euclidean distance
-chest_distance = ||left_mid - right_mid||
+if len(peaks) == 0:
+    time_since_start >= apnea_sec
+elif len(peaks) > 0:
+    time_since_last_peak >= apnea_sec
 ```
 
-This distance metric captures chest expansion and contraction during breathing. As the chest expands during inhalation, the distance increases; during exhalation, it decreases.
+### Shallow Breathing
 
-**Normalization:**
-The raw distance is normalized to account for varying distances from the camera:
+**Definition**: Peak-to-peak amplitude < adaptive threshold
+
+**Logic**:
+- Maintain rolling history of recent amplitudes (100 samples)
+- Threshold = median(history) × 0.5
+- Flag if current amplitude < threshold
+
+### Tachypnea / Bradypnea
+
+- **Tachypnea**: BPM > tachy_threshold (default 60)
+- **Bradypnea**: BPM < brady_threshold (default 30)
+
+## Confidence Estimation
+
+**Factors**:
+1. **Shoulder Visibility**: Average of L/R shoulder visibility scores
+2. **Peak Regularity**: 1 - CV(inter-peak intervals)
+3. **Peak Count**: Normalized by target (10 peaks)
+
+**Formula**:
 ```python
-normalized_distance = chest_distance / torso_height
-```
-where `torso_height` is the distance between shoulder midpoint and hip midpoint.
-
-### 2. Signal Buffering
-
-Raw chest distance measurements are stored in a circular buffer for temporal processing.
-
-**Buffer Properties:**
-- **Size**: Typically 300 frames (10 seconds at 30 FPS)
-- **Purpose**: Provides historical context for filtering and pattern detection
-- **Implementation**: Fixed-size deque or numpy array with rolling window
-
-**Benefits:**
-- Enables frequency-domain analysis
-- Smooths out single-frame anomalies
-- Provides sufficient data for breathing cycle detection (normal breathing: 12-20 breaths/minute)
-
-### 3. Butterworth Filtering
-
-A Butterworth bandpass filter removes noise and isolates the breathing frequency range.
-
-**Filter Specifications:**
-- **Type**: Bandpass Butterworth filter
-- **Order**: 4th order (steeper rolloff, better frequency isolation)
-- **Frequency Range**: 0.1 - 0.5 Hz (6-30 breaths per minute)
-  - Lower bound (0.1 Hz): Filters out very slow drift and body movements
-  - Upper bound (0.5 Hz): Removes high-frequency noise (camera jitter, small movements)
-
-**Why Butterworth?**
-- Maximally flat frequency response in passband
-- No ripples in the breathing frequency range
-- Smooth phase response reduces signal distortion
-
-**Implementation:**
-```python
-from scipy.signal import butter, filtfilt
-
-# Design filter
-nyquist = sampling_rate / 2
-low = 0.1 / nyquist  # 6 BPM
-high = 0.5 / nyquist  # 30 BPM
-b, a = butter(4, [low, high], btype='band')
-
-# Apply zero-phase filtering
-filtered_signal = filtfilt(b, a, signal_buffer)
+regularity = 1 - std(intervals) / mean(intervals)
+confidence = min(1.0, regularity × (peak_count / 10.0))
 ```
 
-The `filtfilt` function applies the filter twice (forward and backward) for zero phase distortion.
+**Behavior**:
+- Confidence < 0.5: Suspend BPM updates, display "--"
+- High confidence: Green display
+- Low confidence: Yellow/gray display
 
-### 4. Peak Detection for BPM
+## Performance Characteristics
 
-Breathing cycles are identified by detecting peaks in the filtered signal.
+### Computational Cost
 
-**Peak Detection Algorithm:**
-```python
-from scipy.signal import find_peaks
+- **Pose Detection**: ~30-50ms per frame (CPU)
+- **Signal Processing**: <1ms per frame
+- **Total Pipeline**: ~33ms (30 FPS achievable)
 
-# Detect peaks with constraints
-peaks, properties = find_peaks(
-    filtered_signal,
-    distance=fps * 1.5,      # Minimum 1.5 seconds between breaths
-    prominence=threshold,     # Minimum peak prominence
-    height=mean + 0.5 * std  # Adaptive threshold
-)
+### Accuracy
+
+- **Synthetic Signals**: ±10% of ground truth (tested)
+- **Real-World**: Depends on:
+  - Camera quality
+  - Lighting conditions
+  - Subject movement
+  - Clothing fit
+
+### Latency
+
+- **Detection**: 10-15 seconds for stable BPM (buffer fill time)
+- **Updates**: ~1 second (EMA smoothing lag)
+- **Apnea Alert**: apnea_sec + ~1 second
+
+## Configurability
+
+All thresholds exposed via CLI:
+
+```bash
+--min-sec 15          # Buffer window
+--bpf-low 0.5         # Bandpass low cutoff
+--bpf-high 1.2        # Bandpass high cutoff
+--apnea-sec 20        # Apnea threshold
+--tachy 60            # Tachypnea threshold
+--brady 30            # Bradypnea threshold
 ```
 
-**Parameters:**
-- **Distance**: Minimum frames between peaks (prevents double-counting)
-- **Prominence**: Peak must stand out from surrounding signal
-- **Height**: Adaptive threshold based on signal statistics
+Adapt for different age groups:
+- **Newborns**: `--bpf-high 1.5 --tachy 70`
+- **Toddlers**: `--bpf-low 0.4 --brady 25`
 
-**BPM Calculation:**
-```python
-if len(peaks) >= 2:
-    # Calculate time between consecutive peaks
-    intervals = np.diff(peaks) / fps  # Convert to seconds
-    
-    # Average interval over recent breaths
-    avg_interval = np.mean(intervals[-5:])  # Last 5 breaths
-    
-    # Convert to breaths per minute
-    bpm = 60.0 / avg_interval
-```
+## Known Failure Modes
 
-**Smoothing:**
-BPM values are smoothed using an exponential moving average to reduce jitter:
-```python
-smoothed_bpm = alpha * new_bpm + (1 - alpha) * previous_bpm
-```
-where `alpha = 0.3` provides good responsiveness while filtering noise.
+1. **False Positives**: Hand movements near face
+2. **False Negatives**: Very shallow breathing with thick clothing
+3. **Noise**: Subject rolling/moving significantly
+4. **Occlusion**: Blanket covering shoulders
+5. **Lighting**: Very low light reduces landmark confidence
 
-### 5. Event Logic for Apnea and Shallow Breathing
+## Future Improvements
 
-The system continuously monitors the filtered signal to detect abnormal breathing patterns.
+- Multi-landmark fusion (hips, chest, shoulders)
+- Adaptive bandpass based on detected frequency
+- Motion artifact rejection via accelerometer-like filtering
+- Thermal camera integration for ground truth
 
-#### 5.1 Apnea Detection (Breathing Stopped)
-
-**Definition:** No breathing detected for a prolonged period.
-
-**Detection Logic:**
-```python
-APNEA_THRESHOLD_SECONDS = 10  # No breath for 10 seconds
-
-# Check time since last detected peak
-if current_time - last_peak_time > APNEA_THRESHOLD_SECONDS:
-    trigger_apnea_alert()
-```
-
-**Additional Validation:**
-- Signal variance must be low (confirms lack of movement, not just missed detection)
-- No significant peaks below detection threshold
-
-**Alert Behavior:**
-- Visual warning on screen
-- Optional audio alert
-- Log timestamp and duration
-
-#### 5.2 Shallow Breathing Detection
-
-**Definition:** Breathing amplitude is significantly reduced compared to normal baseline.
-
-**Detection Logic:**
-```python
-SHALLOW_THRESHOLD = 0.6  # 60% of normal amplitude
-
-# Calculate baseline from recent history
-baseline_amplitude = np.percentile(peak_heights[-20:], 75)
-
-# Check current peak amplitudes
-if current_peak_height < SHALLOW_THRESHOLD * baseline_amplitude:
-    shallow_breath_count += 1
-    
-    if shallow_breath_count >= 3:  # 3 consecutive shallow breaths
-        trigger_shallow_breathing_alert()
-```
-
-**Adaptive Baseline:**
-The baseline adjusts over time to account for:
-- Different body types
-- Camera positioning
-- Clothing effects
-
-**Reset Conditions:**
-- Normal breathing detected: Reset counter
-- Deep breath detected: Update baseline upward
-
-#### 5.3 Event State Machine
-
-```
-[NORMAL] ──(no peaks for 10s)──> [APNEA]
-    │                                │
-    │                                │
-    │                          (peak detected)
-    │                                │
-    │                                ↓
-    ├───(3 shallow breaths)──> [SHALLOW] ──(normal breath)──> [NORMAL]
-    │                                │
-    │                                │
-    └────────(normal breath)─────────┘
-```
-
-**State Transitions:**
-- Normal → Apnea: No breath for threshold duration
-- Normal → Shallow: Multiple consecutive shallow breaths
-- Apnea → Normal: Any breath detected
-- Shallow → Normal: Normal amplitude breath detected
-
-## Performance Considerations
-
-### Real-time Processing
-
-- **Frame Rate**: Target 30 FPS
-- **Latency**: < 100ms per frame
-- **Buffer Update**: O(1) with circular buffer
-- **Filtering**: Applied every N frames (e.g., every 10 frames) to balance responsiveness and performance
-
-### Accuracy Improvements
-
-1. **Multi-point averaging**: Use multiple landmark pairs for redundancy
-2. **Outlier rejection**: Remove statistical outliers before filtering
-3. **Confidence thresholding**: Only process frames with high landmark confidence
-4. **Calibration period**: Initial 10-second calibration to establish personal baseline
-
-## Configuration Parameters
-
-| Parameter | Default Value | Description |
-|-----------|--------------|-------------|
-| `buffer_size` | 300 frames | Signal history length |
-| `filter_order` | 4 | Butterworth filter order |
-| `low_freq` | 0.1 Hz | Minimum breathing frequency |
-| `high_freq` | 0.5 Hz | Maximum breathing frequency |
-| `peak_distance` | 1.5 sec | Minimum time between breaths |
-| `apnea_threshold` | 10 sec | Time before apnea alert |
-| `shallow_threshold` | 0.6 | Amplitude ratio for shallow breathing |
-| `bpm_smoothing` | 0.3 | EMA smoothing factor |
-
-## Edge Cases and Limitations
-
-### Handled Cases
-- **Camera movement**: Normalization by torso height
-- **Distance variation**: Relative distance measurements
-- **Clothing**: Loose vs. tight clothing affects amplitude but not frequency
-
-### Known Limitations
-1. **Lateral orientation**: Algorithm assumes frontal or back view
-2. **Occlusion**: Requires clear view of shoulder and hip landmarks
-3. **Very shallow breathing**: May not detect breaths below noise floor
-4. **Non-breathing movement**: Large body movements can create false peaks
-
-## Testing and Validation
-
-See `tests/test_signal.py` for unit tests covering:
-- Keypoint extraction accuracy
-- Filter frequency response
-- Peak detection precision
-- Event trigger conditions
-- Edge case handling
-
-## References
-
-- MediaPipe Pose: https://google.github.io/mediapipe/solutions/pose.html
-- Butterworth Filter Design: scipy.signal documentation
-- Respiratory Rate Monitoring: Clinical standards (12-20 breaths/min for adults)
-
----
-
-*Last updated: 2025-10-16*

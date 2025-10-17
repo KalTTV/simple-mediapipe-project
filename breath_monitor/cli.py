@@ -1,336 +1,211 @@
-#!/usr/bin/env python3
-"""CLI entrypoint for breath monitoring application."""
+"""
+Main CLI entrypoint for breath monitoring.
+Integrates capture, pose detection, signal processing, and visualization.
+"""
 
 import argparse
-import sys
 import time
-import asyncio
-import logging
+import cv2
+import sys
 from typing import Optional
 
-import cv2
-import numpy as np
-
-from breath_monitor.capture import CaptureSource
-from breath_monitor.pose_backend import PoseBackend
-from breath_monitor.signal import SignalProcessor
-from breath_monitor.events import EventBus, BreathMetricsEvent
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from .capture import CameraCapture
+from .pose_backend import PoseBackend
+from .signal import BreathingAnalyzer
+from .draw import BreathingVisualizer
+from .events import WebSocketBroadcaster
 
 
-class BreathMonitorCLI:
-    """CLI application for breath monitoring."""
-
-    def __init__(self, mode: str, websocket: bool = False, port: int = 8765):
-        """
-        Initialize CLI application.
-
-        Args:
-            mode: Operating mode ('face' or 'breath')
-            websocket: Whether to serve WebSocket
-            port: WebSocket port number
-        """
-        self.mode = mode
-        self.websocket = websocket
-        self.port = port
-        self.running = False
-
-        # Components
-        self.capture: Optional[CaptureSource] = None
-        self.pose_backend: Optional[PoseBackend] = None
-        self.signal_processor: Optional[SignalProcessor] = None
-        self.event_bus: Optional[EventBus] = None
-
-    def initialize_components(self) -> bool:
-        """Initialize all required components."""
-        try:
-            logger.info(f"Initializing components for {self.mode} mode...")
-
-            # Initialize capture
-            self.capture = CaptureSource(source=0)
-            if not self.capture.is_opened():
-                logger.error("Failed to open webcam")
-                return False
-
-            # Initialize pose backend (for breath mode)
-            if self.mode == 'breath':
-                self.pose_backend = PoseBackend()
-                self.signal_processor = SignalProcessor(
-                    window_size=150,
-                    sampling_rate=30.0
-                )
-                self.event_bus = EventBus()
-
-                # Subscribe to metrics events
-                self.event_bus.subscribe(
-                    BreathMetricsEvent,
-                    self._handle_metrics_event
-                )
-
-            logger.info("Components initialized successfully")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to initialize components: {e}")
+class BreathMonitor:
+    """Main breath monitoring application."""
+    
+    def __init__(self, args):
+        """Initialize monitor with arguments."""
+        self.args = args
+        
+        # Initialize components
+        self.capture = CameraCapture(args.camera, args.width, args.height, args.fps)
+        self.pose = PoseBackend()
+        self.analyzer = BreathingAnalyzer(
+            window_sec=args.min_sec,
+            bpf_low=args.bpf_low,
+            bpf_high=args.bpf_high,
+            apnea_sec=args.apnea_sec,
+            tachy_threshold=args.tachy,
+            brady_threshold=args.brady
+        )
+        self.visualizer = BreathingVisualizer() if args.draw == "on" else None
+        self.broadcaster = WebSocketBroadcaster() if args.ws == "on" else None
+        
+        # Statistics
+        self.frame_count = 0
+        self.last_log_time = time.time()
+        
+    def start(self) -> bool:
+        """Start all components."""
+        print("=" * 60)
+        print("Infant Breathing Rate Monitor")
+        print("=" * 60)
+        print("\n[WARNING] FOR RESEARCH/DEMO ONLY - NOT A MEDICAL DEVICE\n")
+        
+        if not self.capture.start():
             return False
-
-    def _handle_metrics_event(self, event: BreathMetricsEvent):
-        """Handle breath metrics events."""
-        print(f"\n=== Breath Metrics ===")
-        print(f"Rate: {event.rate:.2f} breaths/min")
-        print(f"Depth: {event.depth:.2f}")
-        print(f"Regularity: {event.regularity:.2f}")
-        print(f"Confidence: {event.confidence:.2f}")
-        print(f"Timestamp: {event.timestamp:.2f}")
-
-    def run_breath_mode(self):
-        """Run breath monitoring mode."""
-        logger.info("Starting breath monitoring...")
-        self.running = True
-
-        frame_count = 0
-        fps_time = time.time()
-        fps = 0.0
-
-        try:
-            while self.running:
-                # Capture frame
-                ret, frame = self.capture.read()
-                if not ret:
-                    logger.warning("Failed to read frame")
-                    continue
-
-                frame_count += 1
-
-                # Calculate FPS
-                current_time = time.time()
-                if current_time - fps_time >= 1.0:
-                    fps = frame_count / (current_time - fps_time)
-                    frame_count = 0
-                    fps_time = current_time
-
-                # Process with pose backend
-                landmarks = self.pose_backend.process_frame(frame)
-
-                if landmarks:
-                    # Extract chest keypoint (average of shoulders and hips)
-                    # Landmarks: 11=left_shoulder, 12=right_shoulder
-                    #            23=left_hip, 24=right_hip
-                    left_shoulder = landmarks[11]
-                    right_shoulder = landmarks[12]
-                    left_hip = landmarks[23]
-                    right_hip = landmarks[24]
-
-                    # Calculate chest center (midpoint between shoulders and hips center)
-                    shoulder_center_y = (left_shoulder.y + right_shoulder.y) / 2
-                    hip_center_y = (left_hip.y + right_hip.y) / 2
-                    chest_y = (shoulder_center_y + hip_center_y) / 2
-
-                    # Send to signal processor
-                    self.signal_processor.add_sample(chest_y, current_time)
-
-                    # Process metrics if enough data
-                    metrics = self.signal_processor.compute_metrics()
-                    if metrics:
-                        # Emit metrics event
-                        event = BreathMetricsEvent(
-                            rate=metrics['rate'],
-                            depth=metrics['depth'],
-                            regularity=metrics['regularity'],
-                            confidence=metrics['confidence'],
-                            timestamp=current_time
-                        )
-                        self.event_bus.emit(event)
-
-                    # Draw visualization
-                    h, w = frame.shape[:2]
-                    chest_pixel_y = int(chest_y * h)
-                    shoulder_center_x = int((left_shoulder.x + right_shoulder.x) / 2 * w)
-
-                    # Draw chest point
-                    cv2.circle(frame, (shoulder_center_x, chest_pixel_y),
-                              10, (0, 255, 0), -1)
-
-                    # Draw skeleton connections
-                    def draw_landmark(lm, color=(255, 0, 0)):
-                        x, y = int(lm.x * w), int(lm.y * h)
-                        cv2.circle(frame, (x, y), 5, color, -1)
-
-                    # Draw key points
-                    draw_landmark(left_shoulder, (0, 255, 255))
-                    draw_landmark(right_shoulder, (0, 255, 255))
-                    draw_landmark(left_hip, (255, 255, 0))
-                    draw_landmark(right_hip, (255, 255, 0))
-
-                    # Draw connecting lines
-                    cv2.line(frame,
-                            (int(left_shoulder.x * w), int(left_shoulder.y * h)),
-                            (int(right_shoulder.x * w), int(right_shoulder.y * h)),
-                            (255, 0, 0), 2)
-                    cv2.line(frame,
-                            (int(left_hip.x * w), int(left_hip.y * h)),
-                            (int(right_hip.x * w), int(right_hip.y * h)),
-                            (255, 0, 0), 2)
-
-                # Display FPS and status
-                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(frame, f"Mode: {self.mode}", (10, 70),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-                # Show frame
-                cv2.imshow('Breath Monitor', frame)
-
-                # Check for exit
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:  # 'q' or ESC
-                    logger.info("Exit requested")
-                    break
-
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-        except Exception as e:
-            logger.error(f"Error in breath mode: {e}", exc_info=True)
-        finally:
-            self.cleanup()
-
-    def run_face_mode(self):
-        """Run face detection mode (placeholder)."""
-        logger.info("Starting face mode...")
-        logger.info("Face mode is not yet implemented")
-        logger.info("This is a placeholder for future face detection functionality")
-
-        self.running = True
-        try:
-            while self.running:
-                ret, frame = self.capture.read()
-                if not ret:
-                    logger.warning("Failed to read frame")
-                    continue
-
-                # Display frame
-                cv2.putText(frame, "Face Mode - Not Implemented", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                cv2.imshow('Face Mode', frame)
-
-                # Check for exit
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:
-                    break
-
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-        finally:
-            self.cleanup()
-
-    def cleanup(self):
-        """Clean up resources."""
-        logger.info("Cleaning up...")
-        self.running = False
-
-        if self.capture:
-            self.capture.release()
-
-        if self.pose_backend:
-            self.pose_backend.close()
-
-        cv2.destroyAllWindows()
-        logger.info("Cleanup complete")
-
-    def run(self):
-        """Run the CLI application."""
-        if not self.initialize_components():
-            logger.error("Failed to initialize, exiting")
-            return 1
-
-        try:
-            if self.mode == 'breath':
-                self.run_breath_mode()
-            elif self.mode == 'face':
-                self.run_face_mode()
+        
+        if self.broadcaster:
+            self.broadcaster.start()
+        
+        print(f"[CONFIG] Window: {self.args.min_sec}s, "
+              f"Bandpass: {self.args.bpf_low}-{self.args.bpf_high} Hz")
+        print(f"[CONFIG] Apnea: {self.args.apnea_sec}s, "
+              f"Tachy: {self.args.tachy} BPM, Brady: {self.args.brady} BPM")
+        print(f"[CONFIG] Draw: {self.args.draw}, WebSocket: {self.args.ws}")
+        print("\nPress 'q' to quit\n")
+        
+        return True
+    
+    def process_frame(self, frame, timestamp):
+        """Process a single frame."""
+        # Pose detection
+        pose_result = self.pose.infer(frame)
+        
+        # Add signal sample if pose detected with sufficient confidence
+        if pose_result["detected"] and pose_result["confidence"] > 0.5:
+            if pose_result["mid_shoulder_xy"]:
+                # Use Y coordinate (vertical motion) as breathing proxy
+                _, y = pose_result["mid_shoulder_xy"]
+                self.analyzer.add_sample(timestamp, y)
+        
+        # Analyze breathing
+        analysis = self.analyzer.analyze()
+        
+        # Broadcast state if WebSocket enabled
+        if self.broadcaster:
+            self.broadcaster.broadcast_state(
+                bpm=analysis.get("bpm_smooth"),
+                apnea=analysis.get("apnea", False),
+                shallow=analysis.get("shallow", False),
+                confidence=pose_result.get("confidence", 0.0),
+                timestamp=timestamp
+            )
+        
+        # Draw visualization if enabled
+        if self.visualizer:
+            frame = self.visualizer.draw_all(frame, pose_result, analysis)
+        
+        return frame, analysis
+    
+    def log_status(self, analysis):
+        """Log status every second."""
+        current_time = time.time()
+        if current_time - self.last_log_time >= 1.0:
+            bpm = analysis.get("bpm_smooth") or analysis.get("bpm")
+            if bpm is not None:
+                bpm_str = f"{bpm:.1f}"
             else:
-                logger.error(f"Unknown mode: {self.mode}")
-                return 1
-
-            return 0
-
-        except Exception as e:
-            logger.error(f"Fatal error: {e}", exc_info=True)
-            return 1
+                bpm_str = "--"
+            
+            status_flags = []
+            if analysis.get("apnea"):
+                status_flags.append("APNEA")
+            if analysis.get("shallow"):
+                status_flags.append("SHALLOW")
+            if analysis.get("tachypnea"):
+                status_flags.append("TACHY")
+            if analysis.get("bradypnea"):
+                status_flags.append("BRADY")
+            
+            status = " | ".join(status_flags) if status_flags else "OK"
+            
+            print(f"[{self.frame_count:06d}] BPM: {bpm_str:>6s} | "
+                  f"Peaks: {analysis.get('peak_count', 0):2d} | "
+                  f"Conf: {analysis.get('confidence', 0.0):.2f} | "
+                  f"Status: {status}")
+            
+            self.last_log_time = current_time
+    
+    def run(self):
+        """Main processing loop."""
+        if not self.start():
+            return
+        
+        try:
+            for frame, timestamp in self.capture.frames():
+                self.frame_count += 1
+                
+                # Process frame
+                display_frame, analysis = self.process_frame(frame, timestamp)
+                
+                # Log status
+                self.log_status(analysis)
+                
+                # Display if drawing enabled
+                if self.args.draw == "on":
+                    cv2.imshow("Breathing Monitor", display_frame)
+                    
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                        
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted by user")
         finally:
-            self.cleanup()
+            self.stop()
+    
+    def stop(self):
+        """Stop all components."""
+        print("\n[INFO] Shutting down...")
+        self.capture.stop()
+        self.pose.close()
+        
+        if self.broadcaster:
+            self.broadcaster.stop()
+        
+        if self.args.draw == "on":
+            cv2.destroyAllWindows()
+        
+        print("[OK] Shutdown complete")
 
 
 def main():
-    """Main CLI entry point."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Breath monitoring CLI application',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s --mode breath              # Run breath monitoring
-  %(prog)s --mode face                # Run face detection (not implemented)
-  %(prog)s --mode breath --websocket  # Run with WebSocket server
-  %(prog)s --mode breath --port 9000  # Use custom WebSocket port
-
-Controls:
-  Press 'q' or ESC to quit
-        """
+        description="Infant Breathing Rate Monitor using MediaPipe Pose",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-
-    parser.add_argument(
-        '--mode',
-        type=str,
-        choices=['face', 'breath'],
-        required=True,
-        help='Operating mode: face detection or breath monitoring'
-    )
-
-    parser.add_argument(
-        '--websocket',
-        action='store_true',
-        help='Enable WebSocket server for real-time data streaming'
-    )
-
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=8765,
-        help='WebSocket server port (default: 8765)'
-    )
-
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug logging'
-    )
-
+    
+    # Camera settings
+    parser.add_argument("--camera", type=int, default=0, help="Camera device ID")
+    parser.add_argument("--width", type=int, default=640, help="Frame width")
+    parser.add_argument("--height", type=int, default=480, help="Frame height")
+    parser.add_argument("--fps", type=int, default=30, help="Target FPS")
+    
+    # Signal processing settings
+    parser.add_argument("--min-sec", type=float, default=15.0, 
+                       help="Signal buffer window (seconds)")
+    parser.add_argument("--bpf-low", type=float, default=0.5, 
+                       help="Bandpass filter low cutoff (Hz)")
+    parser.add_argument("--bpf-high", type=float, default=1.2, 
+                       help="Bandpass filter high cutoff (Hz)")
+    
+    # Detection thresholds
+    parser.add_argument("--apnea-sec", type=float, default=20.0, 
+                       help="Apnea detection threshold (seconds)")
+    parser.add_argument("--tachy", type=float, default=60.0, 
+                       help="Tachypnea threshold (BPM)")
+    parser.add_argument("--brady", type=float, default=30.0, 
+                       help="Bradypnea threshold (BPM)")
+    
+    # Output settings
+    parser.add_argument("--ws", choices=["on", "off"], default="off", 
+                       help="Enable WebSocket broadcasting")
+    parser.add_argument("--draw", choices=["on", "off"], default="on", 
+                       help="Enable visual overlay")
+    
     args = parser.parse_args()
-
-    # Configure logging level
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
-
-    # Create and run CLI
-    logger.info(f"Starting CLI in {args.mode} mode")
-    if args.websocket:
-        logger.info(f"WebSocket server will be available on port {args.port}")
-
-    cli = BreathMonitorCLI(
-        mode=args.mode,
-        websocket=args.websocket,
-        port=args.port
-    )
-
-    sys.exit(cli.run())
+    
+    monitor = BreathMonitor(args)
+    monitor.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+

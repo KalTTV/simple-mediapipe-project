@@ -1,346 +1,351 @@
-"""Signal processing module for breathing analysis.
-Provides:
-- Ring buffer for signal buffering
-- Butterworth filtering for noise reduction
-- Peak detection for breathing cycles
-- BPM (breaths per minute) calculation
-- Apnea and shallow breathing detection
+"""
+Signal processing for breathing rate detection.
+Includes detrending, bandpass filtering, peak detection, and anomaly detection.
 """
 
 import numpy as np
 from scipy import signal
 from collections import deque
-from typing import Optional, Tuple, List
-import time
+from typing import List, Tuple, Optional, Dict
 
 
 class RingBuffer:
-    """Circular buffer for efficient signal storage."""
-
-    def __init__(self, maxlen: int):
-        """Initialize ring buffer.
-
-        Args:
-            maxlen: Maximum buffer size
+    """Time-based ring buffer for signal data."""
+    
+    def __init__(self, window_seconds: float = 15.0, estimated_fps: float = 30.0):
         """
-        self.buffer = deque(maxlen=maxlen)
-        self.maxlen = maxlen
-        self.timestamps = deque(maxlen=maxlen)
-
-    def append(self, value: float, timestamp: Optional[float] = None):
-        """Add value to buffer.
-
+        Initialize ring buffer.
+        
         Args:
-            value: Signal value to append
-            timestamp: Optional timestamp (defaults to current time)
+            window_seconds: Time window to keep in seconds
+            estimated_fps: Estimated sampling rate for buffer sizing
         """
-        if timestamp is None:
-            timestamp = time.time()
-        self.buffer.append(value)
-        self.timestamps.append(timestamp)
-
-    def get_array(self) -> np.ndarray:
-        """Get buffer contents as numpy array."""
-        return np.array(self.buffer)
-
-    def get_timestamps(self) -> np.ndarray:
-        """Get timestamps as numpy array."""
-        return np.array(self.timestamps)
-
-    def is_full(self) -> bool:
-        """Check if buffer is at capacity."""
-        return len(self.buffer) >= self.maxlen
-
-    def clear(self):
-        """Clear buffer."""
-        self.buffer.clear()
-        self.timestamps.clear()
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class BreathingSignalProcessor:
-    """Process breathing signals with filtering, peak detection, and analysis."""
-
-    def __init__(
-        self,
-        buffer_size: int = 300,
-        sample_rate: float = 30.0,
-        lowcut: float = 0.1,
-        highcut: float = 0.5,
-        filter_order: int = 4,
-        apnea_threshold: float = 10.0,
-        shallow_threshold: float = 0.3,
-        window_seconds: float = 30.0,
-    ):
-        """Initialize breathing signal processor.
-
-        Args:
-            buffer_size: Maximum number of samples to store
-            sample_rate: Sampling frequency in Hz
-            lowcut: Low cutoff frequency for bandpass filter (Hz)
-            highcut: High cutoff frequency for bandpass filter (Hz)
-            filter_order: Order of Butterworth filter
-            apnea_threshold: Seconds without breathing to detect apnea
-            shallow_threshold: Minimum amplitude ratio for shallow breathing
-            window_seconds: Time window for BPM calculation (seconds)
-        """
-        self.buffer = RingBuffer(buffer_size)
-        self.sample_rate = sample_rate
-        self.lowcut = lowcut
-        self.highcut = highcut
-        self.filter_order = filter_order
-        self.apnea_threshold = apnea_threshold
-        self.shallow_threshold = shallow_threshold
         self.window_seconds = window_seconds
+        max_size = int(window_seconds * estimated_fps * 1.5)  # 50% margin
+        self.timestamps = deque(maxlen=max_size)
+        self.values = deque(maxlen=max_size)
+        
+    def add(self, timestamp: float, value: float):
+        """Add a sample to the buffer."""
+        self.timestamps.append(timestamp)
+        self.values.append(value)
+        self._trim_old_samples()
+    
+    def _trim_old_samples(self):
+        """Remove samples older than window."""
+        if len(self.timestamps) < 2:
+            return
+            
+        cutoff_time = self.timestamps[-1] - self.window_seconds
+        while len(self.timestamps) > 0 and self.timestamps[0] < cutoff_time:
+            self.timestamps.popleft()
+            self.values.popleft()
+    
+    def get_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get current buffer data as numpy arrays."""
+        return np.array(self.timestamps), np.array(self.values)
+    
+    def __len__(self) -> int:
+        return len(self.timestamps)
 
-        # State tracking
-        self.last_breath_time = time.time()
-        self.apnea_active = False
-        self.shallow_breathing = False
 
-        # Peak detection history
-        self.peak_times = deque(maxlen=50)
-        self.peak_values = deque(maxlen=50)
+def detrend_signal(signal_data: np.ndarray, method: str = "polynomial", order: int = 2) -> np.ndarray:
+    """
+    Remove trend from signal.
+    
+    Args:
+        signal_data: Input signal
+        method: "polynomial" or "highpass"
+        order: Polynomial order for polynomial method
+        
+    Returns:
+        Detrended signal
+    """
+    if len(signal_data) < 10:
+        return signal_data
+    
+    if method == "polynomial":
+        # Fit polynomial and subtract
+        x = np.arange(len(signal_data))
+        coeffs = np.polyfit(x, signal_data, order)
+        trend = np.polyval(coeffs, x)
+        return signal_data - trend
+    elif method == "highpass":
+        # Simple high-pass filter
+        return signal.detrend(signal_data)
+    else:
+        return signal_data
 
-        # Design Butterworth bandpass filter
-        nyquist = self.sample_rate / 2
-        low = self.lowcut / nyquist
-        high = self.highcut / nyquist
-        self.filter_b, self.filter_a = signal.butter(
-            self.filter_order, [low, high], btype="band"
-        )
 
-    def add_sample(self, value: float, timestamp: Optional[float] = None):
-        """Add a new sample to the buffer.
+def bandpass_filter(signal_data: np.ndarray, fs: float, lowcut: float = 0.5, 
+                   highcut: float = 1.2, order: int = 4) -> np.ndarray:
+    """
+    Apply Butterworth bandpass filter.
+    
+    Args:
+        signal_data: Input signal
+        fs: Sampling frequency
+        lowcut: Low cutoff frequency (Hz)
+        highcut: High cutoff frequency (Hz)
+        order: Filter order
+        
+    Returns:
+        Filtered signal
+    """
+    if len(signal_data) < order * 3:
+        return signal_data
+    
+    nyquist = fs / 2
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    
+    # Ensure frequencies are in valid range
+    low = max(0.01, min(0.99, low))
+    high = max(0.01, min(0.99, high))
+    
+    if low >= high:
+        return signal_data
+    
+    try:
+        sos = signal.butter(order, [low, high], btype='band', output='sos')
+        filtered = signal.sosfiltfilt(sos, signal_data)
+        return filtered
+    except Exception as e:
+        print(f"[WARN] Bandpass filter failed: {e}")
+        return signal_data
 
+
+def detect_peaks(signal_data: np.ndarray, fs: float, refractory_sec: float = 0.6) -> np.ndarray:
+    """
+    Detect peaks in signal using scipy.signal.find_peaks.
+    
+    Args:
+        signal_data: Input signal
+        fs: Sampling frequency
+        refractory_sec: Minimum time between peaks (seconds)
+        
+    Returns:
+        Array of peak indices
+    """
+    if len(signal_data) < 10:
+        return np.array([])
+    
+    distance = max(1, int(refractory_sec * fs))
+    
+    try:
+        peaks, _ = signal.find_peaks(signal_data, distance=distance)
+        return peaks
+    except Exception as e:
+        print(f"[WARN] Peak detection failed: {e}")
+        return np.array([])
+
+
+def calculate_bpm(peak_indices: np.ndarray, timestamps: np.ndarray) -> Optional[float]:
+    """
+    Calculate BPM from peak timestamps.
+    
+    Args:
+        peak_indices: Indices of peaks
+        timestamps: Full timestamp array
+        
+    Returns:
+        BPM value or None if insufficient peaks
+    """
+    if len(peak_indices) < 2:
+        return None
+    
+    # Get peak timestamps
+    peak_times = timestamps[peak_indices]
+    
+    # Calculate inter-peak intervals
+    intervals = np.diff(peak_times)
+    
+    if len(intervals) == 0:
+        return None
+    
+    # Use median interval for robustness
+    median_interval = np.median(intervals)
+    
+    if median_interval <= 0:
+        return None
+    
+    # Convert to BPM (breaths per minute)
+    bpm = 60.0 / median_interval
+    return bpm
+
+
+class BpmSmoother:
+    """Exponential moving average smoother for BPM display."""
+    
+    def __init__(self, alpha: float = 0.3):
+        """
+        Initialize smoother.
+        
         Args:
-            value: Breathing signal value
-            timestamp: Optional timestamp (defaults to current time)
+            alpha: Smoothing factor (0-1). Higher = more responsive.
         """
-        self.buffer.append(value, timestamp)
-
-    def filter_signal(self) -> np.ndarray:
-        """Apply Butterworth bandpass filter to buffer.
-
-        Returns:
-            Filtered signal as numpy array
+        self.alpha = alpha
+        self.value = None
+    
+    def update(self, new_value: Optional[float]) -> Optional[float]:
         """
-        if len(self.buffer) < 10:
-            return self.buffer.get_array()
-
-        raw_signal = self.buffer.get_array()
-        try:
-            filtered = signal.filtfilt(self.filter_b, self.filter_a, raw_signal)
-            return filtered
-        except Exception:
-            return raw_signal
-
-    def detect_peaks(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Detect peaks (breaths) in the filtered signal.
-
-        Returns:
-            Tuple of (peak_indices, peak_values)
-        """
-        if len(self.buffer) < 10:
-            return np.array([]), np.array([])
-
-        filtered = self.filter_signal()
-
-        # Dynamic threshold based on signal statistics
-        mean_val = np.mean(filtered)
-        std_val = np.std(filtered)
-        threshold = mean_val + 0.5 * std_val
-
-        # Find peaks
-        peaks, properties = signal.find_peaks(
-            filtered,
-            height=threshold,
-            distance=int(self.sample_rate * 1.5),  # Min 1.5s between breaths
-        )
-
-        if len(peaks) > 0:
-            peak_values = filtered[peaks]
-            timestamps = self.buffer.get_timestamps()
-            if len(timestamps) > 0:
-                peak_times = timestamps[peaks]
-                self.peak_times.extend(peak_times)
-                self.peak_values.extend(peak_values)
-
-        return peaks, filtered[peaks] if len(peaks) > 0 else np.array([])
-
-    def calculate_bpm(self, window_seconds: float = None) -> Optional[float]:
-        """Calculate breaths per minute from recent peaks.
-
+        Update and return smoothed value.
+        
         Args:
-            window_seconds: Time window to consider (defaults to self.window_seconds)
-
+            new_value: New BPM measurement
+            
         Returns:
-            BPM value or None if insufficient data
+            Smoothed BPM value
         """
-        if window_seconds is None:
-            window_seconds = self.window_seconds
-
-        if len(self.peak_times) < 2:
-            return None
-
-        current_time = time.time()
-        cutoff_time = current_time - window_seconds
-
-        # Get peaks within time window
-        recent_peaks = [t for t in self.peak_times if t >= cutoff_time]
-
-        if len(recent_peaks) < 2:
-            return None
-
-        # Calculate average time between peaks
-        intervals = np.diff(recent_peaks)
-        mean_interval = np.mean(intervals)
-
-        if mean_interval <= 0:
-            return None
-
-        # Convert to breaths per minute
-        bpm = 60.0 / mean_interval
-
-        # Sanity check
-        if bpm < 5 or bpm > 60:
-            return None
-
-        return bpm
-
-    def check_apnea(self) -> bool:
-        """Check if apnea (no breathing) is detected.
-
-        Returns:
-            True if apnea detected
-        """
-        if len(self.peak_times) == 0:
-            return False
-
-        current_time = time.time()
-        time_since_last_peak = current_time - self.peak_times[-1]
-
-        self.apnea_active = time_since_last_peak > self.apnea_threshold
-        return self.apnea_active
-
-    def check_shallow_breathing(self) -> bool:
-        """Check if breathing is shallow.
-
-        Returns:
-            True if shallow breathing detected
-        """
-        if len(self.peak_values) < 3:
-            return False
-
-        recent_peaks = list(self.peak_values)[-5:]
-        mean_amplitude = np.mean(np.abs(recent_peaks))
-        max_amplitude = np.max(np.abs(list(self.peak_values)))
-
-        if max_amplitude == 0:
-            return False
-
-        amplitude_ratio = mean_amplitude / max_amplitude
-        self.shallow_breathing = amplitude_ratio < self.shallow_threshold
-        return self.shallow_breathing
-
-    def get_metrics(self) -> dict:
-        """Get current breathing metrics.
-
-        Returns:
-            Dictionary with BPM, apnea status, and signal quality
-        """
-        self.detect_peaks()
-        bpm = self.calculate_bpm()
-        apnea = self.check_apnea()
-        shallow = self.check_shallow_breathing()
-
-        # Calculate signal quality
-        if len(self.buffer) > 10:
-            filtered = self.filter_signal()
-            snr = np.std(filtered) / (np.mean(np.abs(np.diff(filtered))) + 1e-6)
-            signal_quality = min(1.0, snr / 10.0)
+        if new_value is None:
+            return self.value
+        
+        if self.value is None:
+            self.value = new_value
         else:
-            signal_quality = 0.0
+            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
+        
+        return self.value
+    
+    def reset(self):
+        """Reset smoother."""
+        self.value = None
 
+
+class BreathingAnalyzer:
+    """Complete breathing analysis pipeline."""
+    
+    def __init__(self, window_sec: float = 15.0, bpf_low: float = 0.5, bpf_high: float = 1.2,
+                 apnea_sec: float = 20.0, tachy_threshold: float = 60.0, brady_threshold: float = 30.0):
+        """
+        Initialize breathing analyzer.
+        
+        Args:
+            window_sec: Signal buffer window in seconds
+            bpf_low: Bandpass filter low cutoff (Hz)
+            bpf_high: Bandpass filter high cutoff (Hz)
+            apnea_sec: Apnea detection threshold (seconds without peaks)
+            tachy_threshold: Tachypnea threshold (BPM)
+            brady_threshold: Bradypnea threshold (BPM)
+        """
+        self.buffer = RingBuffer(window_sec)
+        self.bpf_low = bpf_low
+        self.bpf_high = bpf_high
+        self.apnea_sec = apnea_sec
+        self.tachy_threshold = tachy_threshold
+        self.brady_threshold = brady_threshold
+        self.smoother = BpmSmoother(alpha=0.3)
+        
+        # Adaptive threshold for shallow breathing
+        self.amplitude_history = deque(maxlen=100)
+        
+    def add_sample(self, timestamp: float, value: float):
+        """Add a new sample to the buffer."""
+        self.buffer.add(timestamp, value)
+    
+    def analyze(self) -> Dict:
+        """
+        Perform full breathing analysis.
+        
+        Returns:
+            Dictionary with analysis results:
+                - bpm: Current breathing rate
+                - bpm_smooth: Smoothed BPM for display
+                - apnea: Apnea detected
+                - shallow: Shallow breathing detected
+                - tachypnea: Tachypnea detected
+                - bradypnea: Bradypnea detected
+                - confidence: Analysis confidence
+                - peak_count: Number of peaks detected
+        """
+        timestamps, values = self.buffer.get_data()
+        
+        if len(values) < 20:
+            return {
+                "bpm": None,
+                "bpm_smooth": None,
+                "apnea": False,
+                "shallow": False,
+                "tachypnea": False,
+                "bradypnea": False,
+                "confidence": 0.0,
+                "peak_count": 0
+            }
+        
+        # Calculate sampling frequency
+        if len(timestamps) > 1:
+            fs = 1.0 / np.median(np.diff(timestamps))
+        else:
+            fs = 30.0
+        
+        # Detrend
+        detrended = detrend_signal(values, method="polynomial", order=2)
+        
+        # Bandpass filter
+        filtered = bandpass_filter(detrended, fs, self.bpf_low, self.bpf_high)
+        
+        # Detect peaks
+        peaks = detect_peaks(filtered, fs, refractory_sec=0.6)
+        
+        # Calculate BPM
+        bpm = calculate_bpm(peaks, timestamps)
+        bpm_smooth = self.smoother.update(bpm)
+        
+        # Check for apnea (no peaks in recent window)
+        apnea = False
+        if len(peaks) == 0:
+            time_since_start = timestamps[-1] - timestamps[0]
+            if time_since_start >= self.apnea_sec:
+                apnea = True
+        elif len(peaks) > 0:
+            time_since_last_peak = timestamps[-1] - timestamps[peaks[-1]]
+            if time_since_last_peak >= self.apnea_sec:
+                apnea = True
+        
+        # Check for shallow breathing
+        shallow = False
+        if len(peaks) > 2:
+            peak_values = filtered[peaks]
+            amplitude = np.ptp(peak_values)  # Peak-to-peak
+            self.amplitude_history.append(amplitude)
+            
+            if len(self.amplitude_history) >= 10:
+                threshold = np.median(self.amplitude_history) * 0.5
+                if amplitude < threshold:
+                    shallow = True
+        
+        # Check for tachypnea/bradypnea
+        tachypnea = bpm is not None and bpm > self.tachy_threshold
+        bradypnea = bpm is not None and bpm < self.brady_threshold
+        
+        # Calculate confidence (based on signal quality and peak regularity)
+        confidence = 0.0
+        if len(peaks) >= 3:
+            peak_times = timestamps[peaks]
+            intervals = np.diff(peak_times)
+            regularity = 1.0 - min(1.0, np.std(intervals) / (np.mean(intervals) + 1e-6))
+            confidence = min(1.0, regularity * (len(peaks) / 10.0))
+        
         return {
             "bpm": bpm,
+            "bpm_smooth": bpm_smooth,
             "apnea": apnea,
             "shallow": shallow,
-            "signal_quality": signal_quality,
-            "buffer_size": len(self.buffer),
-            "buffer_full": self.buffer.is_full(),
+            "tachypnea": tachypnea,
+            "bradypnea": bradypnea,
+            "confidence": confidence,
+            "peak_count": len(peaks)
         }
 
-    def process(self) -> dict:
-        """Process signal and return breathing metrics (test-compatible interface).
 
-        Returns:
-            Dictionary with 'breathing_rate', 'amplitude', and 'quality'
-        """
-        metrics = self.get_metrics()
-        peaks, peak_vals = self.detect_peaks()
+# Export key functions for unit testing
+__all__ = [
+    "RingBuffer",
+    "detrend_signal",
+    "bandpass_filter",
+    "detect_peaks",
+    "calculate_bpm",
+    "BpmSmoother",
+    "BreathingAnalyzer"
+]
 
-        # Calculate mean amplitude from recent peaks
-        if len(peak_vals) > 0:
-            amplitude = float(np.mean(np.abs(peak_vals)))
-        else:
-            amplitude = 0.0
-
-        return {
-            "breathing_rate": metrics["bpm"],
-            "amplitude": amplitude,
-            "quality": metrics["signal_quality"],
-        }
-
-    def reset(self):
-        """Reset processor state."""
-        self.buffer.clear()
-        self.last_breath_time = time.time()
-        self.apnea_active = False
-        self.shallow_breathing = False
-        self.peak_times.clear()
-        self.peak_values.clear()
-
-
-if __name__ == "__main__":
-    # Test the signal processor
-    print("Testing BreathingSignalProcessor...")
-
-    processor = BreathingSignalProcessor(
-        buffer_size=300, sample_rate=30.0, apnea_threshold=5.0
-    )
-
-    # Simulate breathing signal (sine wave)
-    t = np.linspace(0, 10, 300)  # 10 seconds at 30 Hz
-    breathing_rate = 0.25  # 15 BPM (0.25 Hz)
-    signal_sim = np.sin(2 * np.pi * breathing_rate * t) + np.random.normal(
-        0, 0.1, 300
-    )
-
-    # Add samples
-    for i, value in enumerate(signal_sim):
-        timestamp = time.time() + i / 30.0  # Simulate 30 Hz
-        processor.add_sample(value, timestamp)
-
-    # Get metrics
-    metrics = processor.get_metrics()
-    print(f"\nMetrics:")
-    print(
-        f"  BPM: {metrics['bpm']:.1f}" if metrics["bpm"] else "  BPM: N/A"
-    )
-    print(f"  Apnea: {metrics['apnea']}")
-    print(f"  Shallow: {metrics['shallow']}")
-    print(f"  Signal Quality: {metrics['signal_quality']:.2f}")
-    print(f"  Buffer: {metrics['buffer_size']}/{processor.buffer.maxlen}")
-
-    # Test filtering
-    filtered = processor.filter_signal()
-    print(f"\nFiltered signal shape: {filtered.shape}")
-
-    # Test peak detection
-    peaks, peak_vals = processor.detect_peaks()
-    print(f"Detected {len(peaks)} peaks")
-
-    print("\n✓ Signal processor test complete!")

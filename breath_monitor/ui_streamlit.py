@@ -1,303 +1,214 @@
-"""Streamlit dashboard for breath monitoring.
-
-Provides a web-based UI with:
-- Live video feed
-- Real-time BPM display
-- Apnea and shallow breathing status
-- Line plots of breathing signal
-- WebSocket connection to metrics
+"""
+Streamlit UI for breathing monitor.
+Provides live video, BPM display, status badges, trend chart, and confidence meter.
 """
 
-import asyncio
-import json
-import time
-from collections import deque
-from typing import Optional
-
+import streamlit as st
 import cv2
 import numpy as np
-import streamlit as st
-import websockets
-from streamlit.runtime.scriptrunner import add_script_run_ctx
+import time
+from collections import deque
+import matplotlib.pyplot as plt
+
+from .capture import CameraCapture
+from .pose_backend import PoseBackend
+from .signal import BreathingAnalyzer
+from .draw import BreathingVisualizer
 
 
-class MetricsWebSocket:
-    """WebSocket client for receiving metrics."""
+# Page config
+st.set_page_config(
+    page_title="Breathing Monitor",
+    page_icon="🫁",
+    layout="wide"
+)
 
-    def __init__(self, url: str = "ws://localhost:8765"):
-        self.url = url
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
-        self.connected = False
+# Title and warning
+st.title("🫁 Infant Breathing Rate Monitor")
+st.warning("⚠️ FOR RESEARCH/DEMO ONLY - NOT A MEDICAL DEVICE")
 
-    async def connect(self):
-        """Connect to WebSocket server."""
-        try:
-            self.websocket = await websockets.connect(self.url)
-            self.connected = True
-            return True
-        except Exception as e:
-            st.error(f"WebSocket connection failed: {e}")
-            self.connected = False
-            return False
+# Sidebar controls
+st.sidebar.header("Settings")
 
-    async def receive_metrics(self):
-        """Receive metrics from WebSocket."""
-        if not self.websocket:
-            return None
-        try:
-            message = await asyncio.wait_for(self.websocket.recv(), timeout=0.1)
-            return json.loads(message)
-        except asyncio.TimeoutError:
-            return None
-        except Exception as e:
-            self.connected = False
-            return None
+camera_id = st.sidebar.number_input("Camera ID", value=0, min_value=0, max_value=10)
+min_sec = st.sidebar.slider("Buffer Window (sec)", 10.0, 30.0, 15.0)
+bpf_low = st.sidebar.slider("Bandpass Low (Hz)", 0.2, 1.0, 0.5, 0.1)
+bpf_high = st.sidebar.slider("Bandpass High (Hz)", 0.8, 2.0, 1.2, 0.1)
+apnea_sec = st.sidebar.slider("Apnea Threshold (sec)", 10.0, 40.0, 20.0)
+tachy = st.sidebar.slider("Tachypnea Threshold (BPM)", 50.0, 80.0, 60.0)
+brady = st.sidebar.slider("Bradypnea Threshold (BPM)", 20.0, 40.0, 30.0)
 
-    async def close(self):
-        """Close WebSocket connection."""
-        if self.websocket:
-            await self.websocket.close()
-            self.connected = False
+# Initialize session state
+if "running" not in st.session_state:
+    st.session_state.running = False
+    st.session_state.capture = None
+    st.session_state.pose = None
+    st.session_state.analyzer = None
+    st.session_state.visualizer = None
+    st.session_state.bpm_history = deque(maxlen=300)  # 30 seconds at ~10 Hz
+    st.session_state.time_history = deque(maxlen=300)
 
-
-def init_session_state():
-    """Initialize Streamlit session state variables."""
-    if "bpm_history" not in st.session_state:
-        st.session_state.bpm_history = deque(maxlen=100)
-    if "signal_history" not in st.session_state:
-        st.session_state.signal_history = deque(maxlen=200)
-    if "current_bpm" not in st.session_state:
-        st.session_state.current_bpm = 0.0
-    if "apnea_status" not in st.session_state:
-        st.session_state.apnea_status = False
-    if "shallow_status" not in st.session_state:
-        st.session_state.shallow_status = False
-    if "ws_connected" not in st.session_state:
-        st.session_state.ws_connected = False
-    if "frame_buffer" not in st.session_state:
-        st.session_state.frame_buffer = None
-
-
-def render_status_indicators():
-    """Render status indicators for apnea and shallow breathing."""
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.session_state.apnea_status:
-            st.error("⚠️ APNEA DETECTED")
-        else:
-            st.success("✓ Normal Breathing")
-
-    with col2:
-        if st.session_state.shallow_status:
-            st.warning("⚠️ SHALLOW BREATHING")
-        else:
-            st.success("✓ Normal Depth")
-
-
-def render_bpm_display():
-    """Render current BPM display."""
-    st.metric(
-        label="Current BPM",
-        value=f"{st.session_state.current_bpm:.1f}",
-        delta=None,
-    )
-
-
-def render_signal_plot():
-    """Render breathing signal line plot."""
-    if len(st.session_state.signal_history) > 0:
-        import plotly.graph_objects as go
-
-        signal_data = list(st.session_state.signal_history)
-        time_data = list(range(len(signal_data)))
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=time_data,
-                y=signal_data,
-                mode="lines",
-                name="Breathing Signal",
-                line=dict(color="#1f77b4", width=2),
-            )
+# Start/Stop button
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    if st.button("▶️ Start", disabled=st.session_state.running):
+        st.session_state.capture = CameraCapture(camera_id, 640, 480, 30)
+        st.session_state.pose = PoseBackend()
+        st.session_state.analyzer = BreathingAnalyzer(
+            window_sec=min_sec,
+            bpf_low=bpf_low,
+            bpf_high=bpf_high,
+            apnea_sec=apnea_sec,
+            tachy_threshold=tachy,
+            brady_threshold=brady
         )
+        st.session_state.visualizer = BreathingVisualizer()
+        
+        if st.session_state.capture.start():
+            st.session_state.running = True
+            st.session_state.start_time = time.time()
+            st.rerun()
 
-        fig.update_layout(
-            title="Breathing Signal Over Time",
-            xaxis_title="Sample",
-            yaxis_title="Signal Value",
-            height=300,
-            margin=dict(l=50, r=50, t=50, b=50),
-        )
+with col2:
+    if st.button("⏹️ Stop", disabled=not st.session_state.running):
+        if st.session_state.capture:
+            st.session_state.capture.stop()
+        if st.session_state.pose:
+            st.session_state.pose.close()
+        st.session_state.running = False
+        st.rerun()
 
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Waiting for breathing signal data...")
-
-
-def render_bpm_plot():
-    """Render BPM history line plot."""
-    if len(st.session_state.bpm_history) > 0:
-        import plotly.graph_objects as go
-
-        bpm_data = list(st.session_state.bpm_history)
-        time_data = list(range(len(bpm_data)))
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=time_data,
-                y=bpm_data,
-                mode="lines",
-                name="BPM",
-                line=dict(color="#ff7f0e", width=2),
-            )
-        )
-
-        fig.update_layout(
-            title="BPM History",
-            xaxis_title="Sample",
-            yaxis_title="BPM",
-            height=300,
-            margin=dict(l=50, r=50, t=50, b=50),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Waiting for BPM data...")
-
-
-def render_video_feed():
-    """Render live video feed."""
-    video_placeholder = st.empty()
-
-    if st.session_state.frame_buffer is not None:
-        # Display the current frame
-        video_placeholder.image(
-            st.session_state.frame_buffer,
-            channels="BGR",
-            use_column_width=True,
-        )
-    else:
-        video_placeholder.info("Waiting for video feed...")
-
-    return video_placeholder
-
-
-async def update_metrics_from_websocket(ws_client: MetricsWebSocket):
-    """Update metrics from WebSocket connection."""
-    metrics = await ws_client.receive_metrics()
-    if metrics:
-        # Update BPM
-        if "bpm" in metrics:
-            st.session_state.current_bpm = metrics["bpm"]
-            st.session_state.bpm_history.append(metrics["bpm"])
-
-        # Update breathing signal
-        if "signal" in metrics:
-            st.session_state.signal_history.append(metrics["signal"])
-
-        # Update status flags
-        if "apnea" in metrics:
-            st.session_state.apnea_status = metrics["apnea"]
-
-        if "shallow" in metrics:
-            st.session_state.shallow_status = metrics["shallow"]
-
-        # Update frame if available (base64 encoded)
-        if "frame" in metrics:
-            import base64
-
-            frame_data = base64.b64decode(metrics["frame"])
-            nparr = np.frombuffer(frame_data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            st.session_state.frame_buffer = frame
+# Main UI
+if not st.session_state.running:
+    st.info("Click 'Start' to begin monitoring")
+else:
+    # Create layout
+    video_col, stats_col = st.columns([2, 1])
+    
+    with video_col:
+        st.subheader("Live Video")
+        video_placeholder = st.empty()
+    
+    with stats_col:
+        st.subheader("Status")
+        bpm_placeholder = st.empty()
+        badges_placeholder = st.empty()
+        confidence_placeholder = st.empty()
+    
+    chart_placeholder = st.empty()
+    
+    # Process frames
+    frame_count = 0
+    max_frames = 1000  # Process up to 1000 frames
+    
+    for frame, timestamp in st.session_state.capture.frames():
+        frame_count += 1
+        
+        # Process frame
+        pose_result = st.session_state.pose.infer(frame)
+        
+        # Add signal sample
+        if pose_result["detected"] and pose_result["confidence"] > 0.5:
+            if pose_result["mid_shoulder_xy"]:
+                _, y = pose_result["mid_shoulder_xy"]
+                st.session_state.analyzer.add_sample(timestamp, y)
+        
+        # Analyze
+        analysis = st.session_state.analyzer.analyze()
+        
+        # Draw visualization
+        display_frame = st.session_state.visualizer.draw_all(frame, pose_result, analysis)
+        
+        # Update history
+        bpm = analysis.get("bpm_smooth") or analysis.get("bpm")
+        elapsed = timestamp - st.session_state.start_time
+        st.session_state.time_history.append(elapsed)
+        st.session_state.bpm_history.append(bpm if bpm else 0)
+        
+        # Update UI every 3 frames
+        if frame_count % 3 == 0:
+            # Convert BGR to RGB for display
+            display_frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            video_placeholder.image(display_frame_rgb, channels="RGB", use_container_width=True)
+            
+            # BPM display
+            if bpm is not None:
+                bpm_color = "green"
+                if analysis.get("tachypnea"):
+                    bpm_color = "orange"
+                elif analysis.get("bradypnea"):
+                    bpm_color = "red"
+                
+                bpm_placeholder.markdown(
+                    f"<h1 style='text-align: center; color: {bpm_color};'>{bpm:.1f} BPM</h1>",
+                    unsafe_allow_html=True
+                )
+            else:
+                bpm_placeholder.markdown(
+                    "<h1 style='text-align: center; color: gray;'>-- BPM</h1>",
+                    unsafe_allow_html=True
+                )
+            
+            # Status badges
+            badges = []
+            if analysis.get("apnea"):
+                badges.append("🔴 APNEA")
+            if analysis.get("shallow"):
+                badges.append("🟠 SHALLOW")
+            if analysis.get("tachypnea"):
+                badges.append("🟠 TACHYPNEA")
+            if analysis.get("bradypnea"):
+                badges.append("🟡 BRADYPNEA")
+            
+            if badges:
+                badges_placeholder.markdown(" | ".join(badges))
+            else:
+                badges_placeholder.markdown("🟢 Normal")
+            
+            # Confidence meter
+            confidence = pose_result.get("confidence", 0.0)
+            confidence_placeholder.progress(confidence, text=f"Confidence: {confidence:.0%}")
+            
+            # Trend chart
+            if len(st.session_state.bpm_history) > 10:
+                fig, ax = plt.subplots(figsize=(10, 3))
+                times = list(st.session_state.time_history)
+                bpms = list(st.session_state.bpm_history)
+                
+                # Filter out zeros
+                times_filtered = [t for t, b in zip(times, bpms) if b > 0]
+                bpms_filtered = [b for b in bpms if b > 0]
+                
+                if times_filtered:
+                    ax.plot(times_filtered, bpms_filtered, 'g-', linewidth=2)
+                    ax.axhline(y=tachy, color='orange', linestyle='--', label='Tachy')
+                    ax.axhline(y=brady, color='red', linestyle='--', label='Brady')
+                    ax.set_xlabel("Time (seconds)")
+                    ax.set_ylabel("BPM")
+                    ax.set_title("30-Second Breathing Rate Trend")
+                    ax.grid(True, alpha=0.3)
+                    ax.legend()
+                    
+                    # Show only last 30 seconds
+                    if len(times_filtered) > 0:
+                        ax.set_xlim(max(0, times_filtered[-1] - 30), times_filtered[-1])
+                    
+                    chart_placeholder.pyplot(fig)
+                    plt.close(fig)
+        
+        # Stop after max frames or if user clicked stop
+        if frame_count >= max_frames or not st.session_state.running:
+            break
+        
+        # Small delay to prevent overwhelming the UI
+        time.sleep(0.01)
 
 
 def main():
-    """Main Streamlit application."""
-    st.set_page_config(
-        page_title="Breath Monitor Dashboard",
-        page_icon="🫁",
-        layout="wide",
-    )
-
-    st.title("🫁 Breath Monitor Dashboard")
-    st.markdown("Real-time breathing monitoring with MediaPipe pose detection")
-
-    init_session_state()
-
-    # Sidebar for connection settings
-    with st.sidebar:
-        st.header("Connection Settings")
-        ws_url = st.text_input("WebSocket URL", "ws://localhost:8765")
-
-        if st.button("Connect"):
-            st.session_state.ws_connected = True
-            st.rerun()
-
-        if st.button("Disconnect"):
-            st.session_state.ws_connected = False
-            st.rerun()
-
-        # Connection status
-        if st.session_state.ws_connected:
-            st.success("Connected")
-        else:
-            st.error("Disconnected")
-
-        st.markdown("---")
-        st.header("About")
-        st.markdown(
-            """
-            This dashboard displays real-time breathing metrics:
-            - **BPM**: Breaths per minute
-            - **Apnea**: Breathing stopped
-            - **Shallow**: Reduced breathing depth
-            """
-        )
-
-    # Main layout
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        st.subheader("Live Video Feed")
-        video_placeholder = render_video_feed()
-
-    with col2:
-        st.subheader("Current Status")
-        render_bpm_display()
-        render_status_indicators()
-
-    # Signal plots
-    st.markdown("---")
-    plot_col1, plot_col2 = st.columns(2)
-
-    with plot_col1:
-        render_signal_plot()
-
-    with plot_col2:
-        render_bpm_plot()
-
-    # WebSocket connection and updates
-    if st.session_state.ws_connected:
-        # Note: In a production app, you'd want to use a proper async loop
-        # For this demo, we'll simulate updates
-        # In reality, you'd need to integrate with Streamlit's async support
-        # or use a background thread
-
-        # Placeholder for WebSocket integration
-        # This would typically run in a separate thread or async context
-        st.info(
-            "WebSocket connection enabled. "
-            "For full functionality, ensure the metrics server is running."
-        )
-
-    # Auto-refresh
-    time.sleep(0.1)
-    st.rerun()
+    """Main entry point for Streamlit UI."""
+    pass
 
 
 if __name__ == "__main__":
     main()
+

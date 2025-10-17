@@ -1,7 +1,8 @@
 """
-Tongue Detection Meme Display
-A MediaPipe + OpenCV application that detects when your tongue is out
-and displays different meme images accordingly.
+MediaPipe Demo Application
+Supports multiple modes:
+- face: Tongue Detection Meme Display
+- breath: Infant Breathing Rate Monitor
 
 See TUTORIAL.md for detailed explanations
 """
@@ -10,6 +11,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import os
+import argparse
+import sys
 
 # ============================================================================
 # CONFIGURATION SETTINGS
@@ -270,6 +273,33 @@ def main():
     print("[OK] Application closed successfully.")
     print("Thanks for using Tongue Detection Meme Display!\n")
 
+def run_breath_monitor():
+    """Run breathing monitor mode."""
+    from breath_monitor.cli import main as breath_main
+    breath_main()
+
+
 if __name__ == "__main__":
-    main()
+    # Parse mode argument
+    parser = argparse.ArgumentParser(
+        description="MediaPipe Demo Application",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--mode", choices=["face", "breath"], default="breath",
+                       help="Application mode: face (tongue detection) or breath (breathing monitor)")
+    
+    # Parse known args to allow pass-through of other arguments
+    args, remaining = parser.parse_known_args()
+    
+    if args.mode == "face":
+        print("\n=== Running Face/Tongue Detection Mode ===\n")
+        main()
+    elif args.mode == "breath":
+        print("\n=== Running Breathing Monitor Mode ===\n")
+        # Pass remaining arguments to breath monitor
+        sys.argv = [sys.argv[0]] + remaining
+        run_breath_monitor()
+    else:
+        print(f"Unknown mode: {args.mode}")
+        sys.exit(1)
 
