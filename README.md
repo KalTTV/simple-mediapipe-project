@@ -1,14 +1,38 @@
-# Tongue Detection Meme Display
+# MediaPipe Demo Project
 
-A fun Python application using MediaPipe and OpenCV that detects when your tongue is out and displays different meme images in real-time.
+A collection of MediaPipe and OpenCV applications for learning computer vision and real-time video processing.
 
 **GitHub:** [https://github.com/aaronhubhachen/simple-mediapipe-project](https://github.com/aaronhubhachen/simple-mediapipe-project)
 
+## 🆕 New: Infant Breathing Rate Monitor
+
+Real-time breathing rate monitoring using MediaPipe Pose. Track breathing from shoulder movement with anomaly detection (apnea, shallow breathing, tachypnea, bradypnea).
+
+**⚠️ FOR RESEARCH/DEMO ONLY - NOT A MEDICAL DEVICE**
+
+Enhanced with **chest expansion detection**: 32-point multi-tracker with hysteresis breath counting (prevents BPM overestimation).
+
+```bash
+# Quick start (with chest expansion detection)
+pip install -e .
+python -m breath_monitor --draw on --trackers 32 --min-ibi-sec 2.0
+
+# Or launch web UI
+streamlit run breath_monitor/ui_streamlit.py
+```
+
+See [docs/BREATHING_README.md](docs/BREATHING_README.md) for full documentation.
+
+## Original: Tongue Detection Meme Display
+
+A fun application that detects when your tongue is out and displays different meme images in real-time.
+
 Good for learning about:
-- MediaPipe Face Mesh detection
+- MediaPipe Face Mesh and Pose detection
 - Real-time video processing with OpenCV
-- Facial landmark analysis
+- Facial and body landmark analysis
 - Computer vision basics
+- Signal processing and filtering
 
 New to this project? Start with the [Quick Start Guide](QUICKSTART.md) to get running in 5 minutes.
 
@@ -18,6 +42,16 @@ macOS user? See the [macOS Setup Guide](SETUP_MACOS.md) for platform-specific in
 
 ## Features
 
+### Breathing Monitor
+- Real-time breathing rate (BPM) from shoulder movement
+- Anomaly detection: Apnea, shallow breathing, tachypnea, bradypnea
+- Visual overlay: Pose skeleton, movement trace, HUD badges
+- Streamlit web UI with live charts and controls
+- WebSocket broadcasting for external integrations
+- Fully configurable thresholds and filters
+- Comprehensive unit tests
+
+### Tongue Detection
 - Real-time webcam face detection using MediaPipe Face Mesh
 - Tongue-out detection algorithm
 - Dual window display: Camera input and Meme output
@@ -26,28 +60,38 @@ macOS user? See the [macOS Setup Guide](SETUP_MACOS.md) for platform-specific in
 
 ## Requirements
 
-- **Python 3.11** (specifically 3.11, not 3.13 or other versions)
+- **Python 3.8+** (3.8, 3.9, 3.10, or 3.11 recommended)
 - Webcam (built-in or USB)
-- Two meme images: `apple.png` and `appletongue.png`
+- For tongue detection: Two meme images (`apple.png` and `appletongue.png`)
 - **Operating System:** Windows 10/11, macOS 10.14+, or Linux
 
 ## Installation
 
-### For All Operating Systems:
+### Option 1: Quick Install (Recommended for Breathing Monitor)
 
-1. **Install Python dependencies (using Python 3.11):**
-   
-   **Windows:**
-   ```bash
-   python3.11 -m pip install -r requirements.txt
-   ```
-   
-   **macOS/Linux:**
-   ```bash
-   python3.11 -m pip install -r requirements.txt
-   # or if python3.11 command doesn't exist:
-   pip3 install -r requirements.txt
-   ```
+```bash
+# Clone the repository
+git clone https://github.com/aaronhubhachen/simple-mediapipe-project.git
+cd simple-mediapipe-project
+
+# Install with pip (includes all dependencies)
+pip install -e .
+
+# Or use Make
+make setup
+```
+
+### Option 2: Legacy Install (For Tongue Detection Only)
+
+**Windows:**
+```bash
+python -m pip install -r requirements.txt
+```
+
+**macOS/Linux:**
+```bash
+python3 -m pip install -r requirements.txt
+```
 
 2. **Add your meme images:**
    
@@ -69,7 +113,51 @@ macOS user? See the [macOS Setup Guide](SETUP_MACOS.md) for platform-specific in
 
 ## Usage
 
-### Windows:
+### Mode Selection
+
+The application now supports two modes:
+
+```bash
+# Breathing monitor (default)
+python main.py --mode breath [OPTIONS]
+
+# Tongue detection
+python main.py --mode face
+```
+
+### Breathing Monitor
+
+```bash
+# CLI with chest expansion detection
+python -m breath_monitor --draw on --trackers 32 --min-ibi-sec 2.0
+
+# Adjust debounce (higher = prevents overcounting, lower = more sensitive)
+python -m breath_monitor --draw on --trackers 32 --min-ibi-sec 3.0
+
+# Wide respiratory band (5-72 BPM)
+python -m breath_monitor --draw on --resp-low 0.08 --resp-high 1.2
+
+# Web UI
+streamlit run breath_monitor/ui_streamlit.py
+
+# Using Make
+make run    # CLI
+make ui     # Web UI
+```
+
+**Key Flags**:
+- `--trackers 32`: Number of chest points to track (default: 32)
+- `--min-ibi-sec 2.0`: Minimum inter-breath interval / debounce (prevents double counts)
+- `--resp-low 0.08 --resp-high 1.2`: Wide respiratory band (5-72 BPM)
+- `--tracker-refresh 0.5`: Tracker refresh period (seconds)
+
+**Note**: BPM is displayed as computed (no age-range clamping). Use confidence to judge reliability.
+
+See [docs/BREATHING_README.md](docs/BREATHING_README.md) for detailed usage.
+
+### Tongue Detection (Original)
+
+**Windows:**
 
 **Option 1: Double-click the batch file (easiest):**
 - Simply double-click `run.bat` in File Explorer
@@ -91,101 +179,139 @@ python3.11 main.py
 
 ### macOS/Linux:
 
-**Option 1: Run with shell script (easiest):**
-```bash
-chmod +x run.sh  # Only needed once to make script executable
-./run.sh
-```
+3. **Run tests (optional):**
+   ```bash
+   make test
+   ```
 
-**Option 2: Run directly with Python:**
-```bash
-python3.11 main.py
-# or
-python3 main.py
-```
+4. **Start monitoring:**
+   ```bash
+   python -m breath_monitor.main
+   ```
 
-### Controls
-- Press **'q'** to quit the application
+## How It Works
 
-### How it works
+The breathing monitor uses MediaPipe's Pose Landmarker to track 33 body landmarks in real-time. It focuses on shoulder landmarks (left and right) to detect the subtle vertical movement patterns associated with breathing:
 
-1. The application opens two windows:
-   - **Camera Input**: Shows your live webcam feed with detection status
-   - **Meme Output**: Displays the appropriate meme image
+1. **Pose Detection**: MediaPipe identifies person in frame and tracks 33 landmarks
+2. **Shoulder Tracking**: Monitors y-coordinate changes of left/right shoulder landmarks (landmarks 11 & 12)
+3. **Signal Processing**: Applies smoothing and filtering to reduce noise
+4. **Peak Detection**: Identifies local maxima in smoothed signal as breath cycles
+5. **Rate Calculation**: Computes breathing rate (breaths/minute) from inter-peak intervals
 
-2. When your face is detected:
-   - If your tongue is **NOT out** → displays `apple.png`
-   - If your tongue **IS out** → displays `appletongue.png`
+See [docs/algorithm.md](docs/algorithm.md) for detailed technical documentation.
 
-3. Status indicators appear on the camera input window:
-   - "TONGUE OUT!" (green) - Tongue detected
-   - "No tongue detected" (yellow) - Face detected but no tongue
-   - "No face detected" (red) - No face in view
+## Known Failure Cases
+
+This MVP has limitations and will not work reliably in the following scenarios:
+
+### Environmental Limitations
+- **Poor Lighting**: Dim lighting or harsh shadows degrade pose detection accuracy
+- **Cluttered Background**: Busy backgrounds can interfere with person segmentation
+- **Camera Placement**: Extreme angles or unstable camera mounting affects tracking
+- **Distance**: Too far (>3m) or too close (<0.5m) from camera reduces accuracy
+
+### User-Related Limitations
+- **Movement**: Walking, fidgeting, or upper body movement creates false positives
+- **Clothing**: Bulky clothing or accessories may obscure shoulder landmarks
+- **Body Position**: Lying down, turned away, or partial occlusion breaks tracking
+- **Multiple People**: Only tracks one person; multiple people in frame cause unreliable results
+- **Fast Breathing**: Respiratory rates >30 BPM may be underestimated
+- **Shallow Breathing**: Minimal chest/shoulder excursion may not be detected
+
+### Technical Limitations
+- **Low Frame Rate**: Cameras <20 FPS may miss breathing cycles
+- **CPU Performance**: Slow systems may cause lag and dropped frames
+- **Initial Calibration**: First 10-15 seconds of data are unreliable (calibration period)
+- **Signal Noise**: Even with smoothing, occasional false peaks occur
+
+### Medical Conditions (⚠️ Do Not Use Clinically)
+- **Irregular Breathing**: Conditions like sleep apnea or Cheyne-Stokes respiration not detected
+- **Paradoxical Breathing**: Abnormal breathing patterns may give false readings
+- **Accessory Muscle Use**: Respiratory distress patterns not accurately captured
+
+**Important**: These limitations mean this tool should NEVER be used for medical monitoring, diagnosis, or treatment decisions.
+
+## Controls
+
+- **ESC or Q**: Quit the application
+- **Window**: Click and drag to reposition display window
+
+## Output
+
+The application displays:
+- Live webcam feed with pose landmarks overlaid
+- Current breathing rate (breaths per minute)
+- Status indicator
+- Shoulder landmark visualization
+
+If logging is enabled (`--log-data`), a CSV file is created with:
+- Timestamp
+- Left shoulder Y position
+- Right shoulder Y position  
+- Calculated breathing rate
+- Detection confidence scores
 
 ## Troubleshooting
 
-### Tongue detection not working properly
+**No video feed / Camera not found:**
+- Check camera permissions in system settings
+- Try different `--camera-index` values (0, 1, 2...)
+- Ensure no other application is using the camera
 
-The tongue detection threshold can be adjusted in `main.py`. Look for this line:
+**Pose not detected:**
+- Ensure adequate lighting
+- Position yourself fully in frame, facing camera
+- Try lowering `--min-detection-confidence` to 0.3
+- Check if camera is too close or too far
 
-```python
-TONGUE_OUT_THRESHOLD = 0.03  # Adjust this value based on your needs
-```
+**Erratic breathing rate readings:**
+- Remain still for 15-20 seconds (calibration period)
+- Avoid upper body movement
+- Increase `--smoothing-window` to 7 or 10
+- Ensure proper lighting and camera position
 
-- **Increase the value** (e.g., 0.05) if it's too sensitive (detects tongue when it's not out)
-- **Decrease the value** (e.g., 0.02) if it's not sensitive enough (doesn't detect tongue when it is out)
-
-### Webcam not opening
-
-- Make sure no other application is using the webcam
-- Try changing the camera index in `main.py`: `cap = cv2.VideoCapture(0)` to `cap = cv2.VideoCapture(1)`
-- **macOS users:** Grant camera permissions in System Preferences → Security & Privacy → Camera
-- **Linux users:** Ensure your user is in the `video` group: `sudo usermod -a -G video $USER`
-
-### Images not loading
-
-- Ensure `apple.png` and `appletongue.png` are in the same directory as `main.py`
-- Check that the image files are valid PNG format
-
-## Installation Quick Start
-
-```bash
-# Clone the repository
-git clone https://github.com/aaronhubhachen/simple-mediapipe-project.git
-cd simple-mediapipe-project
-
-# Install dependencies (Python 3.11)
-python3.11 -m pip install -r requirements.txt
-
-# Add your meme images (apple.png and appletongue.png)
-
-# Run the app
-# Windows (PowerShell): .\run.bat
-# Windows (Command Prompt): run.bat
-# Windows (Double-click): Just double-click run.bat
-# macOS/Linux: ./run.sh
-```
-
-See the [Quick Start Guide](QUICKSTART.md) for detailed instructions.
+**Low FPS / Laggy performance:**
+- Reduce resolution: `--width 320 --height 240`
+- Close other applications
+- Ensure Python is using system GPU if available
 
 ## Project Structure
 
 ```
 simple-mediapipe-project/
-├── main.py              # Main application script (well-commented for learning)
-├── requirements.txt     # Python dependencies
-├── run.bat              # Windows batch file to run with Python 3.11
-├── run.sh               # macOS/Linux shell script to run with Python 3.11
-├── README.md            # This file - project overview and documentation
-├── QUICKSTART.md        # Quick 5-minute setup guide
-├── TUTORIAL.md          # Detailed tutorial on how the code works
-├── IMAGE_GUIDE.md       # Guide for finding and preparing images
-├── SETUP_MACOS.md       # macOS-specific setup guide
-├── CONTRIBUTING.md      # Guide for contributors
-├── LICENSE              # MIT License
-├── .gitignore           # Git ignore file
-├── apple.png            # Meme image (normal state) - YOU NEED TO ADD THIS
-└── appletongue.png      # Meme image (tongue out) - YOU NEED TO ADD THIS
+├── breath_monitor/          # 🆕 Breathing monitor package
+│   ├── __init__.py
+│   ├── __main__.py         # Module entrypoint
+│   ├── capture.py          # Camera capture
+│   ├── pose_backend.py     # MediaPipe Pose integration
+│   ├── signal.py           # Signal processing
+│   ├── events.py           # WebSocket broadcasting
+│   ├── draw.py             # Visualization
+│   ├── cli.py              # CLI interface
+│   └── ui_streamlit.py     # Web UI
+├── tests/                   # 🆕 Unit tests
+│   └── test_signal.py
+├── docs/                    # 🆕 Documentation
+│   ├── BREATHING_README.md
+│   ├── algorithm.md
+│   └── validation.md
+├── .github/workflows/       # 🆕 CI/CD
+│   └── ci.yml
+├── main.py                  # Application entrypoint (with mode selection)
+├── pyproject.toml           # 🆕 Modern Python packaging
+├── Makefile                 # 🆕 Build automation
+├── pytest.ini               # 🆕 Test configuration
+├── requirements.txt         # Legacy dependencies
+├── run.bat                  # Windows launcher
+├── run.sh                   # Unix launcher
+├── README.md                # This file
+├── QUICKSTART.md
+├── TUTORIAL.md
+├── IMAGE_GUIDE.md
+├── SETUP_MACOS.md
+├── CONTRIBUTING.md
+└── LICENSE
 ```
 
 ## Technical Details
@@ -230,35 +356,18 @@ Want to make this project your own? Try these modifications:
 
 ## Contributing
 
-Contributions are welcome! Check out the [Contributing Guide](CONTRIBUTING.md) for details on how to get started.
-
-Ideas for contributions:
-- Improve tongue detection algorithm
-- Add support for multiple gestures (smile, wink, etc.)
-- Create a GUI for adjusting sensitivity
-- Add gesture recording/playback
-- Optimize performance
-- Improve cross-platform compatibility
-
-## Platform Support
-
-This project is cross-platform:
-
-| Platform | Status | Instructions |
-|----------|--------|--------------|
-| Windows 10/11 | Fully Supported | Use `run.bat` or see [Quick Start](QUICKSTART.md) |
-| macOS 10.14+ | Fully Supported | See [macOS Setup Guide](SETUP_MACOS.md) |
-| Linux | Supported | Use `run.sh` or see [Quick Start](QUICKSTART.md) |
-
-## Credits
-
-Built with:
-- [MediaPipe](https://google.github.io/mediapipe/) by Google
-- [OpenCV](https://opencv.org/)
-- [NumPy](https://numpy.org/)
-- Python 3.11
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.
 
 ## License
 
-MIT License - Feel free to use and modify as needed. See LICENSE file for details.
+MIT License - see [LICENSE](LICENSE) file for details.
 
+## Acknowledgments
+
+- Built with [MediaPipe](https://google.github.io/mediapipe/) by Google
+- Computer vision powered by [OpenCV](https://opencv.org/)
+- Signal processing with [NumPy](https://numpy.org/) and [SciPy](https://scipy.org/)
+
+## Disclaimer
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. THE AUTHORS AND COPYRIGHT HOLDERS DISCLAIM ALL LIABILITY FOR ANY DAMAGES OR INJURIES ARISING FROM USE OF THIS SOFTWARE. THIS IS NOT A MEDICAL DEVICE AND MUST NOT BE USED FOR MEDICAL PURPOSES.
