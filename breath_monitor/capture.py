@@ -1,5 +1,4 @@
 """Video capture module for breathing monitoring."""
-
 import cv2
 from typing import Generator, Optional
 import numpy as np
